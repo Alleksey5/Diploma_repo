@@ -79,11 +79,16 @@ class HiFiPlusGenerator(torch.nn.Module):
             )
 
         if self.use_spectralmasknet:
-            self.spectralmasknet = nn_utils.SpectralMaskNet(
+            self.spectralmasknet = nn_utils.GainNet(
                 in_ch=ch,
+                n_fft=1024,
+                n_bands=32,
                 block_widths=spectralmasknet_block_widths,
                 block_depth=spectralmasknet_block_depth,
-                norm_type=norm_type
+                norm_type=norm_type,
+                sample_rate=16000,
+                fmin=0,
+                fmax=8000,
             )
 
         self.waveunet_skip_connect = None
