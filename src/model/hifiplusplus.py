@@ -32,6 +32,11 @@ class HiFiPlusGenerator(torch.nn.Module):
         spectralmasknet_block_widths=(8, 12, 24, 32),
         spectralmasknet_block_depth=4,
 
+        use_gainnet=True,
+        gainnet_block_widths=(8, 12, 24, 32),
+        gainnet_block_depth=4,
+        gainnet_n_bands=32,
+
         norm_type: Literal["weight", "spectral"] = "weight",
         use_skip_connect=True,
         waveunet_before_spectralmasknet=True,
@@ -43,6 +48,7 @@ class HiFiPlusGenerator(torch.nn.Module):
         self.use_spectralunet = use_spectralunet
         self.use_waveunet = use_waveunet
         self.use_spectralmasknet = use_spectralmasknet
+        self.use_gainnet = use_gainnet
 
         self.use_skip_connect = use_skip_connect
         self.waveunet_before_spectralmasknet = waveunet_before_spectralmasknet
@@ -86,11 +92,26 @@ class HiFiPlusGenerator(torch.nn.Module):
                 norm_type=norm_type
             )
 
+        if self.use_gainnet:
+            self.gainnet = nn_utils.GainNet(
+                in_ch=ch,
+                n_fft=1024,
+                n_bands=gainnet_n_bands,
+                block_widths=gainnet_block_widths,
+                block_depth=gainnet_block_depth,
+                norm_type=norm_type,
+                sample_rate=16000,
+                fmin=0,
+                fmax=8000,
+            )
+
         self.waveunet_skip_connect = None
         self.spectralmasknet_skip_connect = None
+        self.gainnet_skip_connect = None
         if self.use_skip_connect:
             self.make_waveunet_skip_connect(ch)
             self.make_spectralmasknet_skip_connect(ch)
+            self.make_gainnet_skip_connect(ch)
 
         self.conv_post = None
         self.make_conv_post(ch)
@@ -104,6 +125,12 @@ class HiFiPlusGenerator(torch.nn.Module):
         self.spectralmasknet_skip_connect = self.norm(nn.Conv1d(ch, ch, 1, 1))
         self.spectralmasknet_skip_connect.weight.data = torch.eye(ch, ch).unsqueeze(-1)
         self.spectralmasknet_skip_connect.bias.data.fill_(0.0)
+
+    def make_gainnet_skip_connect(self, ch):
+        self.gainnet_skip_connect = self.norm(nn.Conv1d(ch, ch, 1, 1))
+        self.gainnet_skip_connect.weight.data = torch.eye(ch, ch).unsqueeze(-1)
+        self.gainnet_skip_connect.bias.data.fill_(0.0)
+
 
     def make_conv_post(self, ch):
         self.conv_post = self.norm(nn.Conv1d(ch, 1, 7, 1, padding=3))
@@ -135,6 +162,13 @@ class HiFiPlusGenerator(torch.nn.Module):
             x += self.spectralmasknet_skip_connect(x_a)
         return x
 
+    def apply_gainnet(self, x):
+        x_a = x
+        x = self.gainnet(x)
+        if self.use_skip_connect:
+            x += self.gainnet_skip_connect(x_a)
+        return x
+
     def forward(self, x_orig):
         x = self.apply_spectralunet(x_orig)
         x = self.hifi(x)
@@ -142,6 +176,8 @@ class HiFiPlusGenerator(torch.nn.Module):
             x = self.apply_waveunet(x)
         if self.use_spectralmasknet:
             x = self.apply_spectralmasknet(x)
+        if self.use_gainnet:
+            x = self.apply_gainnet(x)
         if self.use_waveunet and not self.waveunet_before_spectralmasknet:
             x = self.apply_waveunet(x)
 
@@ -176,6 +212,11 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
         spectralmasknet_block_widths=(8, 12, 24, 32),
         spectralmasknet_block_depth=4,
 
+        use_gainnet=True,
+        gainnet_block_widths=(8, 12, 24, 32),
+        gainnet_block_depth=4,
+        gainnet_n_bands=32,
+
         norm_type: Literal["weight", "spectral"] = "weight",
         use_skip_connect=True,
         waveunet_before_spectralmasknet=True,
@@ -204,6 +245,11 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
             use_spectralmasknet=use_spectralmasknet,
             spectralmasknet_block_widths=spectralmasknet_block_widths,
             spectralmasknet_block_depth=spectralmasknet_block_depth,
+
+            use_gainnet=use_gainnet,
+            gainnet_block_widths=gainnet_block_widths,
+            gainnet_block_depth=gainnet_block_depth,
+            gainnet_n_bands=gainnet_n_bands,
 
             norm_type=norm_type,
             use_skip_connect=use_skip_connect,
@@ -268,6 +314,8 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
             x = self.apply_waveunet_a2a(x, x_orig)
         if self.use_spectralmasknet:
             x = self.apply_spectralmasknet(x)
+        if self.use_gainnet:
+            x = self.apply_gainnet(x)
         if self.use_waveunet and not self.waveunet_before_spectralmasknet:
             x = self.apply_waveunet_a2a(x, x_orig)
 

@@ -1,1 +1,5 @@
 _target_: src.model.hifiplusplus.A2AHiFiPlusGeneratorV2
+use_gainnet: true
+gainnet_n_bands: 32
+gainnet_block_depth: 4
+gainnet_block_widths: [8, 12, 24, 32]
