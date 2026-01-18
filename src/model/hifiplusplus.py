@@ -7,34 +7,45 @@ import src.utils.nn_utils as nn_utils
 from src.utils.hifi_utils import mel_spectrogram
 import src.utils.hifi_utils
 
+
 class HiFiPlusGenerator(torch.nn.Module):
     def __init__(
-        self,
-        hifi_resblock="1",
-        hifi_upsample_rates=(8, 8, 2, 2),
-        hifi_upsample_kernel_sizes=(16, 16, 4, 4),
-        hifi_upsample_initial_channel=128,
-        hifi_resblock_kernel_sizes=(3, 7, 11),
-        hifi_resblock_dilation_sizes=((1, 3, 5), (1, 3, 5), (1, 3, 5)),
-        hifi_input_channels=128,
-        hifi_conv_pre_kernel_size=1,
+            self,
+            hifi_resblock="1",
+            hifi_upsample_rates=(8, 8, 2, 2),
+            hifi_upsample_kernel_sizes=(16, 16, 4, 4),
+            hifi_upsample_initial_channel=128,
+            hifi_resblock_kernel_sizes=(3, 7, 11),
+            hifi_resblock_dilation_sizes=((1, 3, 5), (1, 3, 5), (1, 3, 5)),
+            hifi_input_channels=128,
+            hifi_conv_pre_kernel_size=1,
 
-        use_spectralunet=True,
-        spectralunet_block_widths=(8, 16, 24, 32, 64),
-        spectralunet_block_depth=5,
-        spectralunet_positional_encoding=True,
+            use_spectralunet=True,
+            spectralunet_block_widths=(8, 16, 24, 32, 64),
+            spectralunet_block_depth=5,
+            spectralunet_positional_encoding=True,
 
-        use_waveunet=True,
-        waveunet_block_widths=(10, 20, 40, 80),
-        waveunet_block_depth=4,
+            use_waveunet=True,
+            waveunet_block_widths=(10, 20, 40, 80),
+            waveunet_block_depth=4,
 
-        use_spectralmasknet=True,
-        spectralmasknet_block_widths=(8, 12, 24, 32),
-        spectralmasknet_block_depth=4,
+            use_spectralmasknet=True,
+            spectralmasknet_block_widths=(8, 12, 24, 32),
+            spectralmasknet_block_depth=4,
 
-        norm_type: Literal["weight", "spectral"] = "weight",
-        use_skip_connect=True,
-        waveunet_before_spectralmasknet=True,
+            use_gainnet=True,
+            gainnet_block_widths=(8, 12, 24, 32),
+            gainnet_block_depth=4,
+            gainnet_n_bands=32,
+
+            use_deepfilter=True,
+            deepfilter_order=3,
+            deepfilter_f_df_max=6000,
+            deepfilter_hidden=32,
+
+            norm_type: Literal["weight", "spectral"] = "weight",
+            use_skip_connect=True,
+            waveunet_before_spectralmasknet=True,
     ):
         super().__init__()
         self.norm = dict(weight=weight_norm, spectral=spectral_norm)[norm_type]
@@ -43,6 +54,8 @@ class HiFiPlusGenerator(torch.nn.Module):
         self.use_spectralunet = use_spectralunet
         self.use_waveunet = use_waveunet
         self.use_spectralmasknet = use_spectralmasknet
+        self.use_gainnet = use_gainnet
+        self.use_deepfilter = use_deepfilter
 
         self.use_skip_connect = use_skip_connect
         self.waveunet_before_spectralmasknet = waveunet_before_spectralmasknet
@@ -86,11 +99,36 @@ class HiFiPlusGenerator(torch.nn.Module):
                 norm_type=norm_type
             )
 
+        if self.use_gainnet:
+            self.gainnet = nn_utils.GainNet(
+                in_ch=ch,
+                n_fft=1024,
+                n_bands=gainnet_n_bands,
+                block_widths=gainnet_block_widths,
+                block_depth=gainnet_block_depth,
+                norm_type=norm_type,
+                sample_rate=16000,
+                fmin=0,
+                fmax=8000,
+            )
+
+        if self.use_deepfilter:
+            self.deepfilter = nn_utils.DeepFilterStage(
+                in_ch=ch,
+                n_fft=1024,
+                df_order=deepfilter_order,
+                f_df_max=deepfilter_f_df_max,
+                sample_rate=16000,
+                hidden=deepfilter_hidden,
+            )
+
         self.waveunet_skip_connect = None
         self.spectralmasknet_skip_connect = None
+        self.gainnet_skip_connect = None
         if self.use_skip_connect:
             self.make_waveunet_skip_connect(ch)
             self.make_spectralmasknet_skip_connect(ch)
+            self.make_gainnet_skip_connect(ch)
 
         self.conv_post = None
         self.make_conv_post(ch)
@@ -105,6 +143,11 @@ class HiFiPlusGenerator(torch.nn.Module):
         self.spectralmasknet_skip_connect.weight.data = torch.eye(ch, ch).unsqueeze(-1)
         self.spectralmasknet_skip_connect.bias.data.fill_(0.0)
 
+    def make_gainnet_skip_connect(self, ch):
+        self.gainnet_skip_connect = self.norm(nn.Conv1d(ch, ch, 1, 1))
+        self.gainnet_skip_connect.weight.data = torch.eye(ch, ch).unsqueeze(-1)
+        self.gainnet_skip_connect.bias.data.fill_(0.0)
+
     def make_conv_post(self, ch):
         self.conv_post = self.norm(nn.Conv1d(ch, 1, 7, 1, padding=3))
         self.conv_post.apply(nn_utils.init_weights)
@@ -112,7 +155,7 @@ class HiFiPlusGenerator(torch.nn.Module):
     def apply_spectralunet(self, x_orig):
         if self.use_spectralunet:
             pad_size = (
-                nn_utils.closest_power_of_two(x_orig.shape[-1]) - x_orig.shape[-1]
+                    nn_utils.closest_power_of_two(x_orig.shape[-1]) - x_orig.shape[-1]
             )
             x = torch.nn.functional.pad(x_orig, (0, pad_size))
             x = self.spectralunet(x)
@@ -135,6 +178,16 @@ class HiFiPlusGenerator(torch.nn.Module):
             x += self.spectralmasknet_skip_connect(x_a)
         return x
 
+    def apply_gainnet(self, x):
+        x_a = x
+        x = self.gainnet(x)
+        if self.use_skip_connect:
+            x += self.gainnet_skip_connect(x_a)
+        return x
+
+    def apply_deepfilter(self, x):
+        return self.deepfilter(x)
+
     def forward(self, x_orig):
         x = self.apply_spectralunet(x_orig)
         x = self.hifi(x)
@@ -142,6 +195,10 @@ class HiFiPlusGenerator(torch.nn.Module):
             x = self.apply_waveunet(x)
         if self.use_spectralmasknet:
             x = self.apply_spectralmasknet(x)
+        if self.use_gainnet:
+            x = self.apply_gainnet(x)
+        if self.use_deepfilter:
+            x = self.apply_deepfilter(x)
         if self.use_waveunet and not self.waveunet_before_spectralmasknet:
             x = self.apply_waveunet(x)
 
@@ -153,34 +210,39 @@ class HiFiPlusGenerator(torch.nn.Module):
 
 class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
     def __init__(
-        self,
-        hifi_resblock="1",
-        hifi_upsample_rates=(8, 8, 2, 2),
-        hifi_upsample_kernel_sizes=(16, 16, 4, 4),
-        hifi_upsample_initial_channel=128,
-        hifi_resblock_kernel_sizes=(3, 7, 11),
-        hifi_resblock_dilation_sizes=((1, 3, 5), (1, 3, 5), (1, 3, 5)),
-        hifi_input_channels=128,
-        hifi_conv_pre_kernel_size=1,
+            self,
+            hifi_resblock="1",
+            hifi_upsample_rates=(8, 8, 2, 2),
+            hifi_upsample_kernel_sizes=(16, 16, 4, 4),
+            hifi_upsample_initial_channel=128,
+            hifi_resblock_kernel_sizes=(3, 7, 11),
+            hifi_resblock_dilation_sizes=((1, 3, 5), (1, 3, 5), (1, 3, 5)),
+            hifi_input_channels=128,
+            hifi_conv_pre_kernel_size=1,
 
-        use_spectralunet=True,
-        spectralunet_block_widths=(8, 16, 24, 32, 64),
-        spectralunet_block_depth=5,
-        spectralunet_positional_encoding=True,
+            use_spectralunet=True,
+            spectralunet_block_widths=(8, 16, 24, 32, 64),
+            spectralunet_block_depth=5,
+            spectralunet_positional_encoding=True,
 
-        use_waveunet=True,
-        waveunet_block_widths=(10, 20, 40, 80),
-        waveunet_block_depth=4,
+            use_waveunet=True,
+            waveunet_block_widths=(10, 20, 40, 80),
+            waveunet_block_depth=4,
 
-        use_spectralmasknet=True,
-        spectralmasknet_block_widths=(8, 12, 24, 32),
-        spectralmasknet_block_depth=4,
+            use_spectralmasknet=True,
+            spectralmasknet_block_widths=(8, 12, 24, 32),
+            spectralmasknet_block_depth=4,
 
-        norm_type: Literal["weight", "spectral"] = "weight",
-        use_skip_connect=True,
-        waveunet_before_spectralmasknet=True,
+            use_gainnet=True,
+            gainnet_block_widths=(8, 12, 24, 32),
+            gainnet_block_depth=4,
+            gainnet_n_bands=32,
 
-        waveunet_input: Literal["waveform", "hifi", "both"] = "both",
+            norm_type: Literal["weight", "spectral"] = "weight",
+            use_skip_connect=True,
+            waveunet_before_spectralmasknet=True,
+
+            waveunet_input: Literal["waveform", "hifi", "both"] = "both",
     ):
         super().__init__(
             hifi_resblock=hifi_resblock,
@@ -205,6 +267,16 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
             spectralmasknet_block_widths=spectralmasknet_block_widths,
             spectralmasknet_block_depth=spectralmasknet_block_depth,
 
+            use_gainnet=use_gainnet,
+            gainnet_block_widths=gainnet_block_widths,
+            gainnet_block_depth=gainnet_block_depth,
+            gainnet_n_bands=gainnet_n_bands,
+
+            use_deepfilter=use_deepfilter,
+            deepfilter_order=deepfilter_order,
+            deepfilter_f_df_max=deepfilter_f_df_max,
+            deepfilter_hidden=deepfilter_hidden,
+
             norm_type=norm_type,
             use_skip_connect=use_skip_connect,
             waveunet_before_spectralmasknet=waveunet_before_spectralmasknet,
@@ -225,7 +297,7 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
                     1 + self.hifi.out_channels, self.hifi.out_channels, 1
                 )
             )
-        
+
     @staticmethod
     def get_melspec(x):
         shape = x.shape
@@ -233,7 +305,7 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
         x = mel_spectrogram(x, 1024, 80, 16000, 256, 1024, 0, 8000)
         x = x.view(shape[0], -1, x.shape[-1])
         return x
-    
+
     @staticmethod
     def get_spec(x):
         shape = x.shape
@@ -268,6 +340,10 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
             x = self.apply_waveunet_a2a(x, x_orig)
         if self.use_spectralmasknet:
             x = self.apply_spectralmasknet(x)
+        if self.use_gainnet:
+            x = self.apply_gainnet(x)
+        if self.use_deepfilter:
+            x = self.apply_deepfilter(x)
         if self.use_waveunet and not self.waveunet_before_spectralmasknet:
             x = self.apply_waveunet_a2a(x, x_orig)
 

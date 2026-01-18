@@ -643,3 +643,231 @@ class SpectralMaskNet(nn.Module):
             ),
         )
         return y.view(x.shape[0], x.shape[1], -1)
+
+class GainNet(nn.Module):
+    """
+    Band-gain postprocessor:
+    x (B, C, T) -> STFT -> band-gains (B, C, BANDS, frames) -> expand to F bins -> iSTFT -> (B, C, T)
+    """
+    def __init__(
+        self,
+        in_ch=8,
+        n_fft=1024,
+        hop_length=None,
+        win_length=None,
+        n_bands=32,
+        act="softplus",
+        block_widths=(8, 12, 24, 32),
+        block_depth=1,
+        norm_type: Literal["weight", "spectral", "id"] = "id",
+        sample_rate=16000,
+        fmin=0,
+        fmax=8000,
+    ):
+        super().__init__()
+        self.in_ch = in_ch
+        self.n_fft = n_fft
+        self.hop_length = hop_length if hop_length is not None else n_fft // 4
+        self.win_length = win_length if win_length is not None else n_fft
+        self.n_bands = n_bands
+
+        self.net = MultiScaleResnet2d(
+            block_widths=block_widths,
+            block_depth=block_depth,
+            scale_factor=2,
+            in_width=in_ch,
+            out_width=in_ch,
+            norm_type=norm_type,
+        )
+
+        if act == "softplus":
+            self.act = nn.Softplus()
+        else:
+            self.act = nn.ReLU()
+
+        mel_fb = librosa_mel_fn(
+            sr=sample_rate,
+            n_fft=n_fft,
+            n_mels=n_bands,
+            fmin=fmin,
+            fmax=fmax,
+        )
+        mel_fb = torch.from_numpy(mel_fb).float()  # (BANDS, F)
+        self.register_buffer("band_fb", mel_fb)
+
+        fb_t = mel_fb.T  # (F, BANDS)
+        fb_t = fb_t / (fb_t.sum(dim=-1, keepdim=True) + 1e-8)
+        self.register_buffer("band_fb_inv", fb_t)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, C, T)
+        return: (B, C, T)
+        """
+        B, C, T = x.shape
+        assert C == self.in_ch, f"Expected in_ch={self.in_ch}, got C={C}"
+
+        x_flat = x.reshape(B * C, T)
+
+        win = torch.hann_window(self.win_length, device=x.device)
+
+        X = torch.stft(
+            x_flat,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=win,
+            center=True,
+            return_complex=True,
+        )
+
+        mag = (X.abs() + 1e-9)
+        band_mag = torch.matmul(self.band_fb.to(mag), mag)
+
+        band_mag_2d = band_mag.view(B, C, self.n_bands, band_mag.shape[-1])
+
+        frames = band_mag_2d.shape[-1]
+        pad = int(math.ceil(frames / 8.0)) * 8 - frames
+        pad_right = pad // 2
+        pad_left = pad - pad_right
+        band_mag_2d = F.pad(band_mag_2d, (pad_left, pad_right))
+
+        gains = self.act(self.net(band_mag_2d))
+
+        if pad_right != 0:
+            gains = gains[..., pad_left:-pad_right]
+        else:
+            gains = gains[..., pad_left:]
+
+        gains_flat = gains.view(B * C, self.n_bands, gains.shape[-1])
+        gains_F = torch.matmul(self.band_fb_inv.to(gains_flat), gains_flat)
+
+        Y = X * gains_F
+
+        y = torch.istft(
+            Y,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=win,
+            center=True,
+            length=T,
+        )
+
+        return y.view(B, C, T)
+
+class DeepFilterStage(nn.Module):
+    """
+    DF stage: комплексный FIR по времени в STFT домене (per-frequency),
+    применяется только до f_df_max Гц.
+
+    x: (B, C, T)
+      -> STFT (complex)
+      -> предсказываем комплексные тапы C(k,i,f) и гейт alpha(f,t)
+      -> Y(f,t) = sum_i C_i(f,t) * X(f,t-i)   (каузально)
+      -> mix: X_df = alpha*Y + (1-alpha)*X
+      -> вставляем обратно в X (только низкие частоты)
+      -> iSTFT
+    """
+
+    def __init__(
+        self,
+        in_ch: int,
+        n_fft: int = 1024,
+        hop_length: int | None = None,
+        win_length: int | None = None,
+        df_order: int = 3,
+        f_df_max: int = 6000,
+        sample_rate: int = 16000,
+        hidden: int = 32,
+    ):
+        super().__init__()
+        self.in_ch = in_ch
+        self.n_fft = n_fft
+        self.hop_length = hop_length if hop_length is not None else n_fft // 4
+        self.win_length = win_length if win_length is not None else n_fft
+        self.df_order = df_order
+        self.taps = df_order + 1
+        self.sample_rate = sample_rate
+
+        F = n_fft // 2 + 1
+
+        self.f_bins_df = int(round((f_df_max / (sample_rate / 2)) * (F - 1)))
+        self.f_bins_df = max(1, min(self.f_bins_df, F))
+
+        self.net = nn.Sequential(
+            nn.Conv2d(1, hidden, 3, padding=1),
+            nn.LeakyReLU(0.1),
+            nn.Conv2d(hidden, hidden, 3, padding=1),
+            nn.LeakyReLU(0.1),
+        )
+        self.head_c = nn.Conv2d(hidden, 2 * self.taps, 1)
+        self.head_a = nn.Conv2d(hidden, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, C, T)
+        return: (B, C, T)
+        """
+        B, C, T = x.shape
+        assert C == self.in_ch, f"Expected in_ch={self.in_ch}, got C={C}"
+
+        x_flat = x.reshape(B * C, T)
+        win = torch.hann_window(self.win_length, device=x.device)
+
+        X = torch.stft(
+            x_flat,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=win,
+            center=True,
+            return_complex=True,
+        )
+
+        F_bins, frames = X.shape[1], X.shape[2]
+        fdf = min(self.f_bins_df, F_bins)
+
+        X_low = X[:, :fdf, :]
+        mag = (X_low.abs() + 1e-9).log()
+        inp = mag.unsqueeze(1)
+
+        h = self.net(inp)
+        c = self.head_c(h)
+        a = self.head_a(h)
+        c = torch.tanh(c)
+
+        alpha = torch.sigmoid(a)
+        c = c.view(B * C, self.taps, 2, fdf, frames)
+        c_re = c[:, :, 0, :, :]
+        c_im = c[:, :, 1, :, :]
+        Cc = torch.complex(c_re, c_im)
+
+        X_stack = []
+        for i in range(self.taps):
+            if i == 0:
+                X_stack.append(X_low)
+            else:
+                pad = torch.zeros((B * C, fdf, i), device=X_low.device, dtype=X_low.dtype)
+                X_shift = torch.cat([pad, X_low[:, :, :frames - i]], dim=2)
+                X_stack.append(X_shift)
+        Xs = torch.stack(X_stack, dim=1)
+
+        Y = (Cc * Xs).sum(dim=1)
+        alpha2 = alpha.squeeze(1)
+        X_low_df = alpha2 * Y + (1.0 - alpha2) * X_low
+
+        X_out = X.clone()
+        X_out[:, :fdf, :] = X_low_df
+
+        y = torch.istft(
+            X_out,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=win,
+            center=True,
+            length=T,
+        )
+
+        return y.view(B, C, T)
