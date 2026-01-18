@@ -1,0 +1,10 @@
+train: [] # metrics that are calculated during training
+inference: # metrics that are calculated during inference (eval)
+  - _target_: src.metrics.pesq
+    name: "PESQ" # it is better to avoid spaces in names
+  - _target_: src.metrics.sdri
+    name: "SDRI"
+  - _target_: src.metrics.snr
+    name: "SNR"
+  - _target_: src.metrics.stoi
+    name: "STOI"

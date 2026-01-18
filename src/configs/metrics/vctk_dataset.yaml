@@ -1,0 +1,31 @@
+train: [] # metrics that are calculated during training
+inference: 
+  - _target_: src.metrics.pesq.PESQ
+    name: "PESQ"
+    use_pit: false
+
+  - _target_: src.metrics.sdri.SI_SDR
+    name: "SI_SDR"
+    use_pit: false
+
+  - _target_: src.metrics.snr.SNR
+    name: "SNR"
+    use_pit: false
+
+  - _target_: src.metrics.stoi.STOI
+    name: "STOI"
+    use_pit: false
+
+  - _target_: src.metrics.mosnet.MOSNet
+    name: "MOSNet"
+    use_pit: false
+    sr: 16000
+
+  - _target_: src.metrics.rtf.RTF
+    name: "RTF"
+    sample_rate: 16000
+
+  - _target_: src.metrics.thop.THOPMetric
+    name: "THOP"
+    input_shape: [1, 1, 16000]
+    verbose: true
