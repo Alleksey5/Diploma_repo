@@ -643,3 +643,169 @@ class SpectralMaskNet(nn.Module):
             ),
         )
         return y.view(x.shape[0], x.shape[1], -1)
+
+def hz_to_erb(hz: np.ndarray) -> np.ndarray:
+    return 21.4 * np.log10(4.37e-3 * hz + 1.0)
+
+def erb_to_hz(erb: np.ndarray) -> np.ndarray:
+    return (10**(erb / 21.4) - 1.0) / 4.37e-3
+
+def make_erb_filterbank(n_fft: int, sr: int, n_bands: int, f_min: float = 0.0, f_max: float | None = None):
+    n_freq = n_fft // 2 + 1
+    if f_max is None:
+        f_max = sr / 2
+
+    freqs = np.linspace(0, sr / 2, n_freq)
+
+    erb_min = hz_to_erb(np.array([max(f_min, 1e-6)], dtype=np.float64))[0]
+    erb_max = hz_to_erb(np.array([f_max], dtype=np.float64))[0]
+
+    erb_points = np.linspace(erb_min, erb_max, n_bands + 2)
+    hz_points = erb_to_hz(erb_points)
+
+    fb = np.zeros((n_bands, n_freq), dtype=np.float32)
+
+    for b in range(n_bands):
+        f_left, f_center, f_right = hz_points[b], hz_points[b + 1], hz_points[b + 2]
+        left_slope = (freqs - f_left) / max(f_center - f_left, 1e-6)
+        right_slope = (f_right - freqs) / max(f_right - f_center, 1e-6)
+        tri = np.maximum(0.0, np.minimum(left_slope, right_slope))
+        fb[b, :] = tri.astype(np.float32)
+
+    fb_sum = np.maximum(fb.sum(axis=1, keepdims=True), 1e-8)
+    fb = fb / fb_sum
+
+    inv_fb = fb.T
+    inv_sum = np.maximum(inv_fb.sum(axis=1, keepdims=True), 1e-8)
+    inv_fb = inv_fb / inv_sum
+
+    return fb, inv_fb
+
+class DFNetPostProcessor(nn.Module):
+    def __init__(
+        self,
+        in_ch: int,
+        sr: int = 16000,
+        n_fft: int = 1024,
+        hop_length: int | None = None,
+        win_length: int | None = None,
+        n_erb_bands: int = 32,
+        gain_range_db: float = 12.0,
+        df_order: int = 3,
+        f_df_max: int = 6000,
+        enc_hidden: int = 64,
+        df_hidden: int = 32,
+    ):
+        super().__init__()
+        self.in_ch = in_ch
+        self.sr = sr
+        self.n_fft = n_fft
+        self.hop_length = hop_length if hop_length is not None else n_fft // 4
+        self.win_length = win_length if win_length is not None else n_fft
+        self.n_erb_bands = n_erb_bands
+        self.gain_range_db = gain_range_db
+
+        self.df_order = df_order
+        self.taps = df_order + 1
+
+        self.n_freq = n_fft // 2 + 1
+        fdf = int(round((f_df_max / (sr / 2)) * (self.n_freq - 1)))
+        self.f_bins_df = max(1, min(fdf, self.n_freq))
+
+        fb, inv_fb = make_erb_filterbank(n_fft=n_fft, sr=sr, n_bands=n_erb_bands)
+        self.register_buffer("erb_fb", torch.from_numpy(fb))
+        self.register_buffer("inv_erb_fb", torch.from_numpy(inv_fb))
+
+        self.gain_net = nn.Sequential(
+            nn.Conv1d(n_erb_bands, enc_hidden, kernel_size=5, padding=2),
+            nn.LeakyReLU(0.1),
+            nn.Conv1d(enc_hidden, enc_hidden, kernel_size=5, padding=2),
+            nn.LeakyReLU(0.1),
+            nn.Conv1d(enc_hidden, n_erb_bands, kernel_size=1),
+        )
+
+        self.df_feat = nn.Sequential(
+            nn.Conv2d(3, df_hidden, 3, padding=1),
+            nn.LeakyReLU(0.1),
+            nn.Conv2d(df_hidden, df_hidden, 3, padding=1),
+            nn.LeakyReLU(0.1),
+        )
+        self.df_head_c = nn.Conv2d(df_hidden, 2 * self.taps, 1)
+        self.df_head_a = nn.Conv2d(df_hidden, 1, 1)
+
+    def _stft(self, x_flat: torch.Tensor) -> torch.Tensor:
+        win = torch.hann_window(self.win_length, device=x_flat.device)
+        return torch.stft(
+            x_flat,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=win,
+            center=True,
+            return_complex=True,
+        )
+
+    def _istft(self, X: torch.Tensor, length: int) -> torch.Tensor:
+        win = torch.hann_window(self.win_length, device=X.device)
+        return torch.istft(
+            X,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=win,
+            center=True,
+            length=length,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, T = x.shape
+        assert C == self.in_ch, f"Expected in_ch={self.in_ch}, got {C}"
+
+        x_flat = x.reshape(B * C, T)
+        X = self._stft(x_flat)
+
+        BC, F, frames = X.shape
+        mag = X.abs() + 1e-9
+
+        erb = torch.einsum("bf, cft -> cbt", self.erb_fb, mag)
+        erb_feat = torch.log(erb + 1e-9)
+        g_logits = self.gain_net(erb_feat)
+        g_db = torch.tanh(g_logits) * self.gain_range_db
+        g_lin = torch.pow(10.0, g_db / 20.0)
+
+        G_f = torch.einsum("fb, cbt -> cft", self.inv_erb_fb, g_lin)
+        Xg = X * G_f.to(X.dtype)
+
+        fdf = self.f_bins_df
+        Xg_low = Xg[:, :fdf, :]
+
+        logmag = torch.log(Xg_low.abs() + 1e-9)
+        re = Xg_low.real
+        im = Xg_low.imag
+
+        df_in = torch.stack([logmag, re, im], dim=1)
+        h = self.df_feat(df_in)
+        c = torch.tanh(self.df_head_c(h))
+        a = torch.sigmoid(self.df_head_a(h))
+        c = c.view(BC, self.taps, 2, fdf, frames)
+        Cc = torch.complex(c[:, :, 0], c[:, :, 1])
+
+        alpha = a.squeeze(1)
+        X_stack = []
+        for i in range(self.taps):
+            if i == 0:
+                X_stack.append(Xg_low)
+            else:
+                pad = torch.zeros((BC, fdf, i), device=Xg_low.device, dtype=Xg_low.dtype)
+                X_shift = torch.cat([pad, Xg_low[:, :, :frames - i]], dim=2)
+                X_stack.append(X_shift)
+        Xs = torch.stack(X_stack, dim=1)
+
+        Y = (Cc * Xs).sum(dim=1)
+        Xdf_low = alpha * Y + (1.0 - alpha) * Xg_low
+
+        Xout = Xg.clone()
+        Xout[:, :fdf, :] = Xdf_low
+
+        y = self._istft(Xout, length=T)
+        return y.view(B, C, T)

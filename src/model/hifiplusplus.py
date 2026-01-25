@@ -28,9 +28,17 @@ class HiFiPlusGenerator(torch.nn.Module):
         waveunet_block_widths=(10, 20, 40, 80),
         waveunet_block_depth=4,
 
-        use_spectralmasknet=True,
-        spectralmasknet_block_widths=(8, 12, 24, 32),
-        spectralmasknet_block_depth=4,
+        # use_spectralmasknet=True,
+        # spectralmasknet_block_widths=(8, 12, 24, 32),
+        # spectralmasknet_block_depth=4,
+
+        use_dfnetpost=True,
+        dfnet_n_erb_bands=32,
+        dfnet_gain_range_db=12.0,
+        dfnet_df_order=3,
+        dfnet_f_df_max=6000,
+        dfnet_enc_hidden=64,
+        dfnet_df_hidden=32,
 
         norm_type: Literal["weight", "spectral"] = "weight",
         use_skip_connect=True,
@@ -42,7 +50,7 @@ class HiFiPlusGenerator(torch.nn.Module):
 
         self.use_spectralunet = use_spectralunet
         self.use_waveunet = use_waveunet
-        self.use_spectralmasknet = use_spectralmasknet
+        # self.use_spectralmasknet = False
 
         self.use_skip_connect = use_skip_connect
         self.waveunet_before_spectralmasknet = waveunet_before_spectralmasknet
@@ -78,19 +86,34 @@ class HiFiPlusGenerator(torch.nn.Module):
                 norm_type=norm_type
             )
 
-        if self.use_spectralmasknet:
-            self.spectralmasknet = nn_utils.SpectralMaskNet(
+#        if self.use_spectralmasknet:
+#            self.spectralmasknet = nn_utils.SpectralMaskNet(
+#                in_ch=ch,
+#                block_widths=spectralmasknet_block_widths,
+#                block_depth=spectralmasknet_block_depth,
+#                norm_type=norm_type
+#            )
+
+        self.use_dfnetpost = use_dfnetpost
+
+        if self.use_dfnetpost:
+            self.dfnetpost = nn_utils.DFNetPostProcessor(
                 in_ch=ch,
-                block_widths=spectralmasknet_block_widths,
-                block_depth=spectralmasknet_block_depth,
-                norm_type=norm_type
+                sr=16000,
+                n_fft=1024,
+                n_erb_bands=dfnet_n_erb_bands,
+                gain_range_db=dfnet_gain_range_db,
+                df_order=dfnet_df_order,
+                f_df_max=dfnet_f_df_max,
+                enc_hidden=dfnet_enc_hidden,
+                df_hidden=dfnet_df_hidden,
             )
 
         self.waveunet_skip_connect = None
-        self.spectralmasknet_skip_connect = None
-        if self.use_skip_connect:
+#        self.spectralmasknet_skip_connect = None
+        if self.use_skip_connect and self.use_waveunet:
             self.make_waveunet_skip_connect(ch)
-            self.make_spectralmasknet_skip_connect(ch)
+#            self.make_spectralmasknet_skip_connect(ch)
 
         self.conv_post = None
         self.make_conv_post(ch)
@@ -100,10 +123,10 @@ class HiFiPlusGenerator(torch.nn.Module):
         self.waveunet_skip_connect.weight.data = torch.eye(ch, ch).unsqueeze(-1)
         self.waveunet_skip_connect.bias.data.fill_(0.0)
 
-    def make_spectralmasknet_skip_connect(self, ch):
-        self.spectralmasknet_skip_connect = self.norm(nn.Conv1d(ch, ch, 1, 1))
-        self.spectralmasknet_skip_connect.weight.data = torch.eye(ch, ch).unsqueeze(-1)
-        self.spectralmasknet_skip_connect.bias.data.fill_(0.0)
+    # def make_spectralmasknet_skip_connect(self, ch):
+    #     self.spectralmasknet_skip_connect = self.norm(nn.Conv1d(ch, ch, 1, 1))
+    #     self.spectralmasknet_skip_connect.weight.data = torch.eye(ch, ch).unsqueeze(-1)
+    #     self.spectralmasknet_skip_connect.bias.data.fill_(0.0)
 
     def make_conv_post(self, ch):
         self.conv_post = self.norm(nn.Conv1d(ch, 1, 7, 1, padding=3))
@@ -128,20 +151,22 @@ class HiFiPlusGenerator(torch.nn.Module):
             x += self.waveunet_skip_connect(x_a)
         return x
 
-    def apply_spectralmasknet(self, x):
-        x_a = x
-        x = self.spectralmasknet(x)
-        if self.use_skip_connect:
-            x += self.spectralmasknet_skip_connect(x_a)
-        return x
+    # def apply_spectralmasknet(self, x):
+    #     x_a = x
+    #     x = self.spectralmasknet(x)
+    #     if self.use_skip_connect:
+    #         x += self.spectralmasknet_skip_connect(x_a)
+    #     return x
 
     def forward(self, x_orig):
         x = self.apply_spectralunet(x_orig)
         x = self.hifi(x)
         if self.use_waveunet and self.waveunet_before_spectralmasknet:
             x = self.apply_waveunet(x)
-        if self.use_spectralmasknet:
-            x = self.apply_spectralmasknet(x)
+
+        if self.use_dfnetpost:
+            x = self.dfnetpost(x)
+
         if self.use_waveunet and not self.waveunet_before_spectralmasknet:
             x = self.apply_waveunet(x)
 
@@ -172,9 +197,13 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
         waveunet_block_widths=(10, 20, 40, 80),
         waveunet_block_depth=4,
 
-        use_spectralmasknet=True,
-        spectralmasknet_block_widths=(8, 12, 24, 32),
-        spectralmasknet_block_depth=4,
+        use_dfnetpost=True,
+        dfnet_n_erb_bands=32,
+        dfnet_gain_range_db=12.0,
+        dfnet_df_order=3,
+        dfnet_f_df_max=6000,
+        dfnet_enc_hidden=64,
+        dfnet_df_hidden=32,
 
         norm_type: Literal["weight", "spectral"] = "weight",
         use_skip_connect=True,
@@ -201,9 +230,13 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
             waveunet_block_widths=waveunet_block_widths,
             waveunet_block_depth=waveunet_block_depth,
 
-            use_spectralmasknet=use_spectralmasknet,
-            spectralmasknet_block_widths=spectralmasknet_block_widths,
-            spectralmasknet_block_depth=spectralmasknet_block_depth,
+            use_dfnetpost=use_dfnetpost,
+            dfnet_n_erb_bands=dfnet_n_erb_bands,
+            dfnet_gain_range_db=dfnet_gain_range_db,
+            dfnet_df_order=dfnet_df_order,
+            dfnet_f_df_max=dfnet_f_df_max,
+            dfnet_enc_hidden=dfnet_enc_hidden,
+            dfnet_df_hidden=dfnet_df_hidden,
 
             norm_type=norm_type,
             use_skip_connect=use_skip_connect,
@@ -266,8 +299,11 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
         x = self.hifi(x)
         if self.use_waveunet and self.waveunet_before_spectralmasknet:
             x = self.apply_waveunet_a2a(x, x_orig)
-        if self.use_spectralmasknet:
-            x = self.apply_spectralmasknet(x)
+        # if self.use_spectralmasknet:
+        #     x = self.apply_spectralmasknet(x)
+        if self.use_dfnetpost:
+            x = self.dfnetpost(x)
+
         if self.use_waveunet and not self.waveunet_before_spectralmasknet:
             x = self.apply_waveunet_a2a(x, x_orig)
 
