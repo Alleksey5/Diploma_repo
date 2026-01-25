@@ -1,5 +1,5 @@
 import math
-from typing import Literal
+from typing import Literal, Optional
 
 import numpy as np
 import torch
@@ -372,10 +372,13 @@ class MultiScaleResnet2d(nn.Module):
         )
         # padding to across spectral dimension to be divisible by 16
         # (max depth assumed to be 4)
-        pad = 16 - x.shape[-2] % 16
-        shape = x.shape
-        padding = torch.zeros((shape[0], shape[1], pad, shape[3])).to(x)
-        x1 = torch.cat((x, padding), dim=-2)
+        pad = (16 - (x.shape[-2] % 16)) % 16
+        if pad != 0:
+            shape = x.shape
+            padding = torch.zeros((shape[0], shape[1], pad, shape[3]), device=x.device, dtype=x.dtype)
+            x1 = torch.cat((x, padding), dim=-2)
+        else:
+            x1 = x
         return self.net(x1)[:, :, : x.shape[2]]
 
 
@@ -643,3 +646,217 @@ class SpectralMaskNet(nn.Module):
             ),
         )
         return y.view(x.shape[0], x.shape[1], -1)
+
+class SMNLikeERBGainNet(nn.Module):
+    def __init__(
+        self,
+        n_erb_bands: int,
+        block_widths=(8, 12, 24, 32),
+        block_depth=4,
+        norm_type: Literal["weight", "spectral", "id"] = "id",
+    ):
+        super().__init__()
+        self.n_erb_bands = n_erb_bands
+
+        self.net = MultiScaleResnet2d(
+            block_widths=block_widths,
+            block_depth=block_depth,
+            scale_factor=2,
+            in_width=1,
+            out_width=1,
+            norm_type=norm_type,
+            mode="unet_k3_2d",
+        )
+
+    def forward(self, erb_feat: torch.Tensor) -> torch.Tensor:
+        assert erb_feat.dim() == 3, f"Expected (BC,B,K), got {erb_feat.shape}"
+        assert erb_feat.shape[1] == self.n_erb_bands, \
+            f"Expected n_erb_bands={self.n_erb_bands}, got {erb_feat.shape[1]}"
+
+        x = erb_feat.unsqueeze(1)
+        y = self.net(x)
+        return y.squeeze(1)
+
+class DFNetPostProcessor(nn.Module):
+    def __init__(
+        self,
+        in_ch: int,
+        sr: int = 16000,
+        n_fft: int = 1024,
+        hop_length: Optional[int] = None,
+        win_length: Optional[int] = None,
+        n_erb_bands: int = 32,
+        gain_range_db: float = 12.0,
+        df_order: int = 3,
+        f_df_max: int = 6000,
+        enc_hidden: int = 64,
+        df_hidden: int = 32,
+        use_df: bool = True,
+        norm_type: Literal["weight", "spectral", "id"] = "id",
+    ):
+        super().__init__()
+        self.in_ch = in_ch
+        self.sr = sr
+        self.n_fft = n_fft
+        self.hop_length = hop_length if hop_length is not None else n_fft // 4
+        self.win_length = win_length if win_length is not None else n_fft
+        self.n_erb_bands = n_erb_bands
+        self.gain_range_db = float(gain_range_db)
+        self.df_order = int(df_order)
+        self.f_df_max = int(f_df_max)
+        self.use_df = bool(use_df)
+
+        self.gain_net = SMNLikeERBGainNet(
+            n_erb_bands=n_erb_bands,
+            block_widths=(8, 12, 24, 32),
+            block_depth=4,
+            norm_type=norm_type,
+        )
+
+        self.df_enc = nn.Sequential(
+            nn.Conv1d(n_erb_bands, enc_hidden, kernel_size=3, padding=1),
+            nn.LeakyReLU(LRELU_SLOPE),
+            nn.Conv1d(enc_hidden, enc_hidden, kernel_size=3, padding=1),
+            nn.LeakyReLU(LRELU_SLOPE),
+        )
+
+        self.df_time_proj = nn.Sequential(
+            nn.Conv1d(enc_hidden, df_hidden, kernel_size=1),
+            nn.LeakyReLU(LRELU_SLOPE),
+        )
+
+        self._df_head: Optional[nn.Linear] = None
+        self._erb_fb: Optional[torch.Tensor] = None
+        self._erb_fb_t: Optional[torch.Tensor] = None
+
+    def _build_erb_fb(self, device: torch.device, dtype: torch.dtype, n_freq: int):
+        fb = librosa_mel_fn(
+            sr=self.sr,
+            n_fft=self.n_fft,
+            n_mels=self.n_erb_bands,
+            fmin=0,
+            fmax=self.sr / 2,
+        )
+        fb = torch.from_numpy(fb).to(device=device, dtype=dtype)
+
+        fb = fb / (fb.sum(dim=1, keepdim=True) + 1e-8)
+
+        fb_t = fb.transpose(0, 1)
+        fb_t = fb_t / (fb_t.sum(dim=1, keepdim=True) + 1e-8)
+
+        self._erb_fb = fb
+        self._erb_fb_t = fb_t
+
+    def _init_df_head(self, device: torch.device, dtype: torch.dtype, n_freq: int):
+        max_bin = int((self.f_df_max / (self.sr / 2)) * (n_freq - 1))
+        max_bin = max(0, min(n_freq - 1, max_bin))
+        self._df_max_bin = max_bin
+
+        out_dim = (max_bin + 1) * (self.df_order + 1) * 2
+        self._df_head = nn.Linear(self.df_hidden, out_dim).to(device=device, dtype=dtype)
+
+    def _stft(self, x_bc_t: torch.Tensor) -> torch.Tensor:
+        window = torch.hann_window(self.win_length, device=x_bc_t.device, dtype=x_bc_t.dtype)
+        X = torch.stft(
+            x_bc_t,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=window,
+            center=True,
+            return_complex=True,
+        )
+        return X
+
+    def _istft(self, X: torch.Tensor, length: int) -> torch.Tensor:
+        window = torch.hann_window(self.win_length, device=X.device, dtype=X.real.dtype)
+        y = torch.istft(
+            X,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=window,
+            center=True,
+            length=length,
+        )
+        return y
+
+    def _erb_features(self, mag: torch.Tensor) -> torch.Tensor:
+        erb = torch.einsum("bf,cfk->cbk", self._erb_fb, mag)
+        erb = torch.log1p(erb)
+        return erb
+
+    def _erb_to_freq_gains(self, gains_erb: torch.Tensor) -> torch.Tensor:
+        gains_freq = torch.einsum("fb,cbk->cfk", self._erb_fb_t, gains_erb)
+        return gains_freq
+
+    def _apply_gain_stage(self, X: torch.Tensor) -> torch.Tensor:
+        mag = torch.abs(X)
+
+        if self._erb_fb is None or self._erb_fb.device != X.device or self._erb_fb.dtype != mag.dtype:
+            self._build_erb_fb(X.device, mag.dtype, n_freq=mag.shape[1])
+
+        erb_feat = self._erb_features(mag)
+        gain_logits = self.gain_net(erb_feat)
+
+        gain_db = self.gain_range_db * torch.tanh(gain_logits)
+        gain_lin_erb = torch.pow(10.0, gain_db / 20.0)
+
+        gain_lin_freq = self._erb_to_freq_gains(gain_lin_erb)
+
+        Xg = X * gain_lin_freq.to(X.dtype)
+        return Xg, erb_feat
+
+    def _apply_df_stage(self, X: torch.Tensor, erb_feat: torch.Tensor) -> torch.Tensor:
+        if not self.use_df or self.df_order <= 0:
+            return X
+
+        BC, F, K = X.shape
+        dtype = X.dtype
+        device = X.device
+
+        if self._df_head is None:
+            self._init_df_head(device, erb_feat.dtype, n_freq=F)
+
+        h = self.df_enc(erb_feat)
+        h = self.df_time_proj(h)
+
+        h_t = h.permute(0, 2, 1).contiguous()
+        taps_flat = self._df_head(h_t)
+
+        max_bin = self._df_max_bin
+        n_taps = self.df_order + 1
+
+        taps_flat = taps_flat.view(BC, K, (max_bin + 1), n_taps, 2)
+        taps = torch.complex(taps_flat[..., 0], taps_flat[..., 1])
+
+        Xdf = X[:, :max_bin + 1, :]
+        Xdf_pad = F.pad(Xdf, (self.df_order, 0))
+        Xr = Xdf_pad.reshape(BC * (max_bin + 1), 1, K + self.df_order)
+        win = Xr.unfold(dimension=2, size=n_taps, step=1)
+        win = win.squeeze(1)
+        taps2 = taps.permute(0, 2, 1, 3).contiguous()
+        taps2 = taps2.view(BC * (max_bin + 1), K, n_taps)
+
+        Ydf = (win * taps2).sum(dim=-1)
+        Ydf = Ydf.view(BC, (max_bin + 1), K)
+
+        X_out = X.clone()
+        X_out[:, :max_bin + 1, :] = Ydf
+        return X_out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        assert x.dim() == 3, f"Expected (B,C,T), got {x.shape}"
+        B, C, T = x.shape
+        assert C == self.in_ch, f"DFNetPostProcessor expects C={self.in_ch}, got {C}"
+
+        x_bc = x.reshape(B * C, T)
+        X = self._stft(x_bc)
+        Xg, erb_feat = self._apply_gain_stage(X)
+
+        Xdf = self._apply_df_stage(Xg, erb_feat)
+
+        y_bc = self._istft(Xdf, length=T)
+        y = y_bc.view(B, C, T)
+        return y
+
