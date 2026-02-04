@@ -1,6 +1,10 @@
-from pathlib import Path
+# src/trainer/trainer.py
+from __future__ import annotations
 
-import pandas as pd
+import torch
+import torch.nn.functional as F
+import torchaudio
+from torch.nn.utils import clip_grad_norm_
 
 from src.logger.utils import plot_spectrogram
 from src.metrics.tracker import MetricTracker
@@ -9,112 +13,101 @@ from src.trainer.base_trainer import BaseTrainer
 
 class Trainer(BaseTrainer):
     """
-    Trainer class. Defines the logic of batch logging and processing.
+    Supervised trainer for audio super-resolution:
+      wav_lr -> model -> wav_pred  (target: wav_hr)
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # mel params (for logging only)
+        self.mel_n_fft = 1024
+        self.mel_n_mels = 80
+        self.mel_hop = 256
+        self.mel_win = 1024
+        self.mel_fmin = 0.0
+        self.mel_fmax = 8000.0
+
+    def create_mel_spec(self, wav_1d: torch.Tensor, sr: int) -> torch.Tensor:
+        """
+        wav_1d: (B,T)
+        returns: (B, n_mels, frames)  (log-mel)
+        """
+        mel = torchaudio.transforms.MelSpectrogram(
+            sample_rate=sr,
+            n_fft=self.mel_n_fft,
+            win_length=self.mel_win,
+            hop_length=self.mel_hop,
+            f_min=self.mel_fmin,
+            f_max=self.mel_fmax,
+            n_mels=self.mel_n_mels,
+            power=1.0,
+            normalized=False,
+        ).to(wav_1d.device)
+
+        m = mel(wav_1d)
+        m = torch.log(torch.clamp(m, min=1e-5))
+        return m
+
     def process_batch(self, batch, metrics: MetricTracker):
-        """
-        Run batch through the model, compute metrics, compute loss,
-        and do training step (during training stage).
-
-        The function expects that criterion aggregates all losses
-        (if there are many) into a single one defined in the 'loss' key.
-
-        Args:
-            batch (dict): dict-based batch containing the data from
-                the dataloader.
-            metrics (MetricTracker): MetricTracker object that computes
-                and aggregates the metrics. The metrics depend on the type of
-                the partition (train or inference).
-        Returns:
-            batch (dict): dict-based batch containing the data from
-                the dataloader (possibly transformed via batch transform),
-                model outputs, and losses.
-        """
         batch = self.move_batch_to_device(batch)
-        batch = self.transform_batch(batch)  # transform batch on device -- faster
 
-        metric_funcs = self.metrics["inference"]
+        wav_lr = batch["wav_lr"]  # (B,1,T)
+        wav_hr = batch["wav_hr"]  # (B,1,T)
+
         if self.is_train:
-            metric_funcs = self.metrics["train"]
             self.optimizer.zero_grad()
 
-        outputs = self.model(**batch)
-        batch.update(outputs)
+        wav_pred = self.model(wav_lr)  # (B,1,T) ожидается
+        batch["wav_pred"] = wav_pred
 
-        all_losses = self.criterion(**batch)
-        batch.update(all_losses)
+        batch["generated_wav"] = wav_pred
+
+        # loss
+        loss = F.l1_loss(wav_pred, wav_hr)
+        batch["loss"] = loss
 
         if self.is_train:
-            batch["loss"].backward()  # sum of all losses is always called loss
+            loss.backward()
             self._clip_grad_norm()
             self.optimizer.step()
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step()
 
-        # update metrics for each loss (in case of multiple losses)
-        for loss_name in self.config.writer.loss_names:
-            metrics.update(loss_name, batch[loss_name].item())
+        metrics.update("loss", loss.item())
 
-        for met in metric_funcs:
-            metrics.update(met.name, met(**batch))
+        target_sr = int(batch.get("target_sr", 16000))
+        batch["mel_spec_hr"] = self.create_mel_spec(wav_hr.squeeze(1), sr=target_sr).detach()
+        batch["mel_spec_fake"] = self.create_mel_spec(wav_pred.squeeze(1), sr=target_sr).detach()
+
         return batch
 
     def _log_batch(self, batch_idx, batch, mode="train"):
-        """
-        Log data from batch. Calls self.writer.add_* to log data
-        to the experiment tracker.
+        if self.writer is None:
+            return
 
-        Args:
-            batch_idx (int): index of the current batch.
-            batch (dict): dict-based batch after going through
-                the 'process_batch' function.
-            mode (str): train or inference. Defines which logging
-                rules to apply.
-        """
-        # method to log data from you batch
-        # such as audio, text or images, for example
+        part = "train" if mode == "train" else "val"
 
-        # logging scheme might be different for different partitions
-        if mode == "train":  # the method is called only every self.log_step steps
-            self.log_spectrogram(**batch)
-        else:
-            # Log Stuff
-            self.log_spectrogram(**batch)
-            self.log_predictions(**batch)
+        # ---- audio logging ----
+        wav_lr = batch["wav_lr"]
+        wav_hr = batch["wav_hr"]
+        generated = batch["generated_wav"]
 
-    def log_spectrogram(self, spectrogram, **batch):
-        spectrogram_for_plot = spectrogram[0].detach().cpu()
-        image = plot_spectrogram(spectrogram_for_plot)
-        self.writer.add_image("spectrogram", image)
+        initial_sr = int(batch.get("initial_sr", 4000))
+        target_sr = int(batch.get("target_sr", 16000))
 
-    def log_predictions(
-        self, text, log_probs, log_probs_length, audio_path, examples_to_log=10, **batch
-    ):
-        # TODO add beam search
-        # Note: by improving text encoder and metrics design
-        # this logging can also be improved significantly
+        n = min(2, wav_lr.shape[0])
+        for i in range(n):
+            self.writer.add_audio(f"{part}/lr_{i}", wav_lr[i], initial_sr)
+            self.writer.add_audio(f"{part}/hr_{i}", wav_hr[i], target_sr)
+            self.writer.add_audio(f"{part}/pred_{i}", generated[i], target_sr)
 
-        argmax_inds = log_probs.cpu().argmax(-1).numpy()
-        argmax_inds = [
-            inds[: int(ind_len)]
-            for inds, ind_len in zip(argmax_inds, log_probs_length.numpy())
-        ]
-        argmax_texts_raw = [self.text_encoder.decode(inds) for inds in argmax_inds]
-        argmax_texts = [self.text_encoder.ctc_decode(inds) for inds in argmax_inds]
-        tuples = list(zip(argmax_texts, text, argmax_texts_raw, audio_path))
+        # ---- spectrogram logging ----
+        mel_lr = self.create_mel_spec(wav_lr.squeeze(1), sr=initial_sr)
+        mel_hr = batch["mel_spec_hr"]
+        mel_fake = batch["mel_spec_fake"]
 
-        rows = {}
-        for pred, target, raw_pred, audio_path in tuples[:examples_to_log]:
-            target = self.text_encoder.normalize_text(target)
-
-            rows[Path(audio_path).name] = {
-                "target": target,
-                "raw prediction": raw_pred,
-                "predictions": pred,
-                "wer": wer,
-                "cer": cer,
-            }
-        self.writer.add_table(
-            "predictions", pd.DataFrame.from_dict(rows, orient="index")
-        )
+        for i in range(n):
+            self.writer.add_image(f"{part}/melspec_lr_{i}", plot_spectrogram(mel_lr[i].detach().cpu()))
+            self.writer.add_image(f"{part}/melspec_hr_{i}", plot_spectrogram(mel_hr[i].detach().cpu()))
+            self.writer.add_image(f"{part}/melspec_pred_{i}", plot_spectrogram(mel_fake[i].detach().cpu()))

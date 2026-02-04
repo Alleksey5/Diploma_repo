@@ -43,7 +43,7 @@ trainer:
   log_step: 1
   n_epochs: 1
   epoch_len: 2
-  device_tensors: ["wav_lr", "wav_hr", "melspec_lr", "melspec_hr"]
+  device_tensors: ["wav_lr", "wav_hr"]
   resume_from: null
   device: auto
   override: True

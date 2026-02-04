@@ -511,7 +511,6 @@ class BaseTrainer:
             )
         self.model.load_state_dict(checkpoint["state_dict"])
 
-        # load optimizer state from checkpoint only when optimizer type is not changed.
         if (
             checkpoint["config"]["optimizer"] != self.config["optimizer"]
             or checkpoint["config"]["lr_scheduler"] != self.config["lr_scheduler"]
@@ -541,7 +540,7 @@ class BaseTrainer:
             pretrained_path (str): path to the model state dict.
         """
         pretrained_path = str(pretrained_path)
-        if hasattr(self, "logger"):  # to support both trainer and inferencer
+        if hasattr(self, "logger"):
             self.logger.info(f"Loading model weights from: {pretrained_path} ...")
         else:
             print(f"Loading model weights from: {pretrained_path} ...")

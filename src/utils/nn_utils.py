@@ -176,7 +176,17 @@ class ConcatSkipConn(nn.Module):
         self.net = net
 
     def forward(self, x):
-        return torch.cat([x, self.net(x)], 1)
+        y = self.net(x)
+
+        tx = x.shape[-1]
+        ty = y.shape[-1]
+
+        if ty < tx:
+            y = F.pad(y, (0, tx - ty))
+        elif ty > tx:
+            y = y[..., :tx]
+
+        return torch.cat([x, y], dim=1)
 
 
 def build_block(
@@ -705,6 +715,8 @@ class DFNetPostProcessor(nn.Module):
         self.df_order = int(df_order)
         self.f_df_max = int(f_df_max)
         self.use_df = bool(use_df)
+        self.enc_hidden = int(enc_hidden)
+        self.df_hidden = int(df_hidden)
 
         self.gain_net = SMNLikeERBGainNet(
             n_erb_bands=n_erb_bands,
@@ -811,12 +823,13 @@ class DFNetPostProcessor(nn.Module):
         if not self.use_df or self.df_order <= 0:
             return X
 
-        BC, F, K = X.shape
+        BC, n_freq, K = X.shape
+
         dtype = X.dtype
         device = X.device
 
         if self._df_head is None:
-            self._init_df_head(device, erb_feat.dtype, n_freq=F)
+            self._init_df_head(device, erb_feat.dtype, n_freq=n_freq)
 
         h = self.df_enc(erb_feat)
         h = self.df_time_proj(h)
