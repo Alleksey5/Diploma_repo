@@ -42,10 +42,11 @@ def move_batch_transforms_to_device(batch_transforms, device):
     for transform_type, transforms in batch_transforms.items():
         if transforms is None:
             continue
-        
+
         for transform_name, transform in transforms.items():
             if isinstance(transform, torch.nn.Module):
                 transforms[transform_name] = transform.to(device)
+
 
 def get_dataloaders(config, device):
     """
@@ -60,9 +61,14 @@ def get_dataloaders(config, device):
         dataloaders (dict[DataLoader]): Dictionary containing dataloaders.
         batch_transforms (dict[Callable] | None): Batch-level transformations.
     """
-    # Initialize batch transforms
-    batch_transforms = instantiate(config.transforms.batch_transforms)
-    move_batch_transforms_to_device(batch_transforms, device)
+
+    # ---------- batch_transforms: optional ----------
+    batch_transforms = None
+    if hasattr(config, "transforms") and config.transforms is not None:
+        if hasattr(config.transforms, "batch_transforms") and config.transforms.batch_transforms is not None:
+            batch_transforms = instantiate(config.transforms.batch_transforms)
+            move_batch_transforms_to_device(batch_transforms, device)
+    # -----------------------------------------------
 
     # Dynamically load collate_fn from string path in config
     collate_fn = None
@@ -87,7 +93,7 @@ def get_dataloaders(config, device):
             drop_last=(dataset_partition == "train"),
             shuffle=(dataset_partition == "train"),
             worker_init_fn=set_worker_seed,
-            collate_fn=collate_fn,  # Добавляем кастомный collate_fn
+            collate_fn=collate_fn,
         )
         dataloaders[dataset_partition] = partition_dataloader
 

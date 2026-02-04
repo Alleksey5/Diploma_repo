@@ -1,0 +1,12 @@
+_target_: src.model.hifiplusplus.A2AHiFiPlusGeneratorV2
+
+use_spectralunet: true
+use_waveunet: true
+
+use_dfnetpost: true
+dfnet_n_erb_bands: 32
+dfnet_gain_range_db: 12.0
+dfnet_df_order: 3
+dfnet_f_df_max: 6000
+dfnet_enc_hidden: 64
+dfnet_df_hidden: 32
