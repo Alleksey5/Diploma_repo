@@ -20,12 +20,3 @@ inference:
     name: "MOSNet"
     use_pit: false
     sr: 16000
-
-  - _target_: src.metrics.rtf.RTF
-    name: "RTF"
-    sample_rate: 16000
-
-  - _target_: src.metrics.thop.THOPMetric
-    name: "THOP"
-    input_shape: [1, 1, 16000]
-    verbose: true

@@ -1,10 +1,26 @@
 from pathlib import Path
 
 import pandas as pd
+import torch
 
 from src.logger.utils import plot_spectrogram
 from src.metrics.tracker import MetricTracker
 from src.trainer.base_trainer import BaseTrainer
+from src.utils.hifi_utils import mel_spectrogram
+
+def _squeeze_ch1(x: torch.Tensor) -> torch.Tensor:
+    if x.dim() == 3 and x.size(1) == 1:
+        return x.squeeze(1)
+    return x
+
+def _norm_to_unit(x: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
+    x = x.float()
+    mx = x.abs().amax(dim=-1, keepdim=True)
+    x = x / (mx + eps)
+    return torch.clamp(x, -1.0, 1.0)
+
+def _is_silent(x: torch.Tensor, thr: float = 1e-4) -> torch.Tensor:
+    return (x.abs().mean(dim=-1) < thr)
 
 
 class Trainer(BaseTrainer):
@@ -13,52 +29,69 @@ class Trainer(BaseTrainer):
     """
 
     def process_batch(self, batch, metrics: MetricTracker):
-        """
-        Run batch through the model, compute metrics, compute loss,
-        and do training step (during training stage).
-
-        The function expects that criterion aggregates all losses
-        (if there are many) into a single one defined in the 'loss' key.
-
-        Args:
-            batch (dict): dict-based batch containing the data from
-                the dataloader.
-            metrics (MetricTracker): MetricTracker object that computes
-                and aggregates the metrics. The metrics depend on the type of
-                the partition (train or inference).
-        Returns:
-            batch (dict): dict-based batch containing the data from
-                the dataloader (possibly transformed via batch transform),
-                model outputs, and losses.
-        """
         batch = self.move_batch_to_device(batch)
-        batch = self.transform_batch(batch)  # transform batch on device -- faster
+        batch = self.transform_batch(batch)
 
         metric_funcs = self.metrics["inference"]
         if self.is_train:
             metric_funcs = self.metrics["train"]
             self.optimizer.zero_grad()
 
-        outputs = self.model(**batch)
-        batch.update(outputs)
+        batch["pred_audio"] = self.model(batch["audio"])
 
-        all_losses = self.criterion(**batch)
-        batch.update(all_losses)
+        T = min(batch["pred_audio"].shape[-1], batch["tg_audio"].shape[-1])
+        batch["pred_audio"] = batch["pred_audio"][..., :T]
+        batch["tg_audio"]   = batch["tg_audio"][..., :T]
+
+        batch["loss"] = self.criterion(batch["pred_audio"], batch["tg_audio"])
 
         if self.is_train:
-            batch["loss"].backward()  # sum of all losses is always called loss
+            batch["loss"].backward()
             self._clip_grad_norm()
             self.optimizer.step()
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step()
 
-        # update metrics for each loss (in case of multiple losses)
-        for loss_name in self.config.writer.loss_names:
-            metrics.update(loss_name, batch[loss_name].item())
+        pred = _squeeze_ch1(batch["pred_audio"])
+        tgt  = _squeeze_ch1(batch["tg_audio"])
+        batch["predict"] = pred
+        batch["source"]  = tgt
 
-        for met in metric_funcs:
-            metrics.update(met.name, met(**batch))
+        metrics.update("loss", float(batch["loss"].item()))
+
+        if not self.is_train:
+            for met in metric_funcs:
+                try:
+                    if met.name.upper() == "PESQ":
+                        src = _norm_to_unit(batch["source"].detach()).cpu()
+                        prd = _norm_to_unit(batch["predict"].detach()).cpu()
+
+                        silent = _is_silent(src) | _is_silent(prd)
+                        if silent.all():
+                            metrics.update(met.name, 0.0)
+                            continue
+
+                        src = src[~silent]
+                        prd = prd[~silent]
+
+                        val = met(source=src, predict=prd)
+
+                    else:
+                        if hasattr(met, "metric") and hasattr(met.metric, "to"):
+                            met.metric = met.metric.to(batch["predict"].device)
+
+                        val = met(source=batch["source"], predict=batch["predict"])
+
+                    if hasattr(val, "item"):
+                        val = float(val.item())
+                    metrics.update(met.name, float(val))
+
+                except Exception as e:
+                    print(f"[WARNING] Metric {met.name} failed: {e}")
+                    metrics.update(met.name, 0.0)
+
         return batch
+
 
     def _log_batch(self, batch_idx, batch, mode="train"):
         """
@@ -76,45 +109,23 @@ class Trainer(BaseTrainer):
         # such as audio, text or images, for example
 
         # logging scheme might be different for different partitions
-        if mode == "train":  # the method is called only every self.log_step steps
-            self.log_spectrogram(**batch)
-        else:
-            # Log Stuff
-            self.log_spectrogram(**batch)
-            self.log_predictions(**batch)
+        if mode == "train":
+            self.log_audio(**batch)
+            self.log_melspec(**batch)
 
-    def log_spectrogram(self, spectrogram, **batch):
-        spectrogram_for_plot = spectrogram[0].detach().cpu()
-        image = plot_spectrogram(spectrogram_for_plot)
-        self.writer.add_image("spectrogram", image)
+    def log_audio(self, audio, tg_audio, pred_audio, **batch):
+    # логнем первый пример
+        self.writer.add_audio("audio_in",  audio[0].detach().cpu(), 16000)
+        self.writer.add_audio("audio_gt",  tg_audio[0].detach().cpu(), 16000)
+        self.writer.add_audio("audio_pred", pred_audio[0].detach().cpu(), 16000)
 
-    def log_predictions(
-        self, text, log_probs, log_probs_length, audio_path, examples_to_log=10, **batch
-    ):
-        # TODO add beam search
-        # Note: by improving text encoder and metrics design
-        # this logging can also be improved significantly
+    def log_melspec(self, tg_audio, pred_audio, **batch):
+        # (B,1,T) -> (T)
+        gt = tg_audio[0].detach().cpu().squeeze(0)
+        pr = pred_audio[0].detach().cpu().squeeze(0)
 
-        argmax_inds = log_probs.cpu().argmax(-1).numpy()
-        argmax_inds = [
-            inds[: int(ind_len)]
-            for inds, ind_len in zip(argmax_inds, log_probs_length.numpy())
-        ]
-        argmax_texts_raw = [self.text_encoder.decode(inds) for inds in argmax_inds]
-        argmax_texts = [self.text_encoder.ctc_decode(inds) for inds in argmax_inds]
-        tuples = list(zip(argmax_texts, text, argmax_texts_raw, audio_path))
+        gt_mel = mel_spectrogram(gt.unsqueeze(0), 1024, 80, 16000, 256, 1024, 0, 8000)
+        pr_mel = mel_spectrogram(pr.unsqueeze(0), 1024, 80, 16000, 256, 1024, 0, 8000)
 
-        rows = {}
-        for pred, target, raw_pred, audio_path in tuples[:examples_to_log]:
-            target = self.text_encoder.normalize_text(target)
-
-            rows[Path(audio_path).name] = {
-                "target": target,
-                "raw prediction": raw_pred,
-                "predictions": pred,
-                "wer": wer,
-                "cer": cer,
-            }
-        self.writer.add_table(
-            "predictions", pd.DataFrame.from_dict(rows, orient="index")
-        )
+        self.writer.add_image("mel_gt", plot_spectrogram(gt_mel))
+        self.writer.add_image("mel_pred", plot_spectrogram(pr_mel))

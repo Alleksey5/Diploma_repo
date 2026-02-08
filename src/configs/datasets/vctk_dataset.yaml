@@ -1,9 +1,23 @@
-test:
+train:
   _target_: src.datasets.vctk_dataset.VCTKDataset
-  dataset_split_file: "/content/Course_work_2/data/vctk_test.txt"
-  vctk_wavs_dir: "/content/Course_work_2/data/VCTK/wavs"
+  dataset_split_file: "/content/Diploma_repo/data/vctk_split_train.txt"   # или свой файл
+  vctk_wavs_dir: "/content/Diploma_repo/data/VCTK/wavs"
   segment_size: 8192
   sampling_rate: 16000
   window: 4096
   split: True
+  shuffle: True
+  limit: 1
+  instance_transforms: ${transforms.instance_transforms.train}
+
+val:
+  _target_: src.datasets.vctk_dataset.VCTKDataset
+  dataset_split_file: "/content/Diploma_repo/data/vctk_test.txt"
+  vctk_wavs_dir: "/content/Diploma_repo/data/VCTK/wavs"
+  segment_size: 8192
+  sampling_rate: 16000
+  window: 4096
+  split: True
+  shuffle: False
+  limit: 1
   instance_transforms: ${transforms.instance_transforms.inference}

@@ -1,43 +1,50 @@
 import torch
-from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
-
-def closest_power_of_two(n):
+def closest_power_of_two(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
-
 def custom_collate(batch):
-    """
-    Custom collate function that pads audio tensors to the closest power of two in time dimension.
-
-    Args:
-        batch (list): List of dataset items, each containing multiple segments.
-
-    Returns:
-        dict: Collated batch with padded tensors.
-    """
-    batch_dict = {"audio": [], "tg_audio": [], "file_id": [], "size": 0}
+    audio_list, tg_list = [], []
+    audio_lens, tg_lens = [], []
+    file_ids, sizes = [], []
 
     for sample in batch:
-        for segment in sample:  # Each sample is a list of segments
-            batch_dict["audio"].append(segment["audio"])
-            batch_dict["tg_audio"].append(segment["tg_audio"])
-            batch_dict["file_id"].append(segment["file_id"])
-            batch_dict["size"] = segment["size"]
+        for seg in sample:
+            a = seg["audio"]
+            t = seg["tg_audio"]
 
-    # Найдём максимальную длину и ближайшую степень двойки
-    max_len = max([x.shape[-1] for x in batch_dict["audio"]])
+            # гарантируем форму (1, T) чтобы stack был предсказуемый
+            if a.dim() == 1:
+                a = a.unsqueeze(0)
+            if t.dim() == 1:
+                t = t.unsqueeze(0)
+
+            audio_list.append(a)
+            tg_list.append(t)
+
+            audio_lens.append(a.shape[-1])
+            tg_lens.append(t.shape[-1])
+
+            file_ids.append(seg.get("file_id", ""))
+            sizes.append(seg.get("size", 0))
+
+    max_len = max(max(audio_lens), max(tg_lens))
     pad_len = closest_power_of_two(max_len)
 
-    def pad_to_power_of_two(x):
+    def pad_right(x):
         pad_size = pad_len - x.shape[-1]
-        return F.pad(x, (0, pad_size), mode="constant", value=0)
+        return F.pad(x, (0, pad_size), value=0.0)
 
-    batch_dict["audio"] = torch.stack([pad_to_power_of_two(x) for x in batch_dict["audio"]])
-    if all(x.shape == batch_dict["tg_audio"][0].shape for x in batch_dict["tg_audio"]):
-        batch_dict["tg_audio"] = torch.stack(batch_dict["tg_audio"])
-    else:
-        batch_dict["tg_audio"] = batch_dict["tg_audio"]
+    audio = torch.stack([pad_right(x) for x in audio_list], dim=0)      # (B, 1, pad_len)
+    tg_audio = torch.stack([pad_right(x) for x in tg_list], dim=0)      # (B, 1, pad_len)
 
-    return batch_dict
+    return {
+        "audio": audio,
+        "tg_audio": tg_audio,
+        "audio_len": torch.tensor(audio_lens, dtype=torch.long),  # (B,)
+        "tg_len": torch.tensor(tg_lens, dtype=torch.long),        # (B,)
+        "file_id": file_ids,
+        "size": sizes,
+        "pad_len": pad_len,
+    }
