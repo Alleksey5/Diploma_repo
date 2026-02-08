@@ -18,17 +18,16 @@ lr_scheduler:
   _target_: torch.optim.lr_scheduler.OneCycleLR
   max_lr: 1e-3
   pct_start: 0.1
-  steps_per_epoch: ${trainer.epoch_len}
-  epochs: ${trainer.n_epochs}
+  steps_per_epoch: 1
+  epochs: 1 
   anneal_strategy: cos
 
 trainer:
   device_tensors: ["audio", "tg_audio"]
   device: auto
-  n_epochs: 1
-  epoch_len: 1
-  log_step: 1
-  save_period: 1
+  n_epochs: 3
+  log_step: 3
+  save_period: 3
   save_dir: "saved"
   seed: 1
   override: True

@@ -1,7 +1,7 @@
 train:
   _target_: src.datasets.vctk_dataset.VCTKDataset
-  dataset_split_file: "/content/Diploma_repo/data/vctk_split_train.txt"   # или свой файл
-  vctk_wavs_dir: "/content/Diploma_repo/data/VCTK/wavs"
+  dataset_split_file: "/content/Diploma_repo/data/training_filtered.txt"   # или свой файл
+  vctk_wavs_dir: "/content/Diploma_repo/data/VCTK_wav"
   segment_size: 8192
   sampling_rate: 16000
   window: 4096
@@ -12,8 +12,8 @@ train:
 
 val:
   _target_: src.datasets.vctk_dataset.VCTKDataset
-  dataset_split_file: "/content/Diploma_repo/data/vctk_test.txt"
-  vctk_wavs_dir: "/content/Diploma_repo/data/VCTK/wavs"
+  dataset_split_file: "/content/Diploma_repo/data/validation_filtered.txt"
+  vctk_wavs_dir: "/content/Diploma_repo/data/VCTK_wav"
   segment_size: 8192
   sampling_rate: 16000
   window: 4096
