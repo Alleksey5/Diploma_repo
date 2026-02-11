@@ -1,167 +1,160 @@
-import os
+from pathlib import Path
+from torch.utils.data import Dataset
+import torchaudio
 import random
-import torch
+from tqdm import tqdm
+from src.datasets.base_dataset import BaseDataset
+import os
 import librosa
+import torch
+import scipy
 import numpy as np
 from librosa.util import normalize
-from scipy import signal
-from src.datasets.base_dataset import BaseDataset
 
+
+from src.model.melspec import MelSpectrogramConfig, MelSpectrogram
+
+
+# class HiFiGanDataset(BaseDataset):
+#     def __init__(self, data_path, limit=None, max_len=22528, **kwargs):
+#         data_path = Path(data_path)
+#         self.mel_creator = MelSpectrogram(MelSpectrogramConfig())
+#         self.wavs_and_paths = []
+#         self.max_len = max_len
+#         for file_path in tqdm((data_path).iterdir(), desc='Loading files'):
+#             wav, sr = torchaudio.load(file_path)
+#             if sr != 22050:
+#                 wav = torchaudio.functional.resample(wav, sr, 22050)
+#             wav = wav[0:1, :]
+#             path = file_path
+#             self.wavs_and_paths.append({'wav' : wav, 'path' : path})
+#         if limit is not None:
+#             self.wavs_and_paths = self.wavs_and_paths[:limit]
+
+#     def __len__(self):
+#         return len(self.wavs_and_paths)
+
+#     def __getitem__(self, idx):
+#         wav = self.wavs_and_paths[idx]['wav']
+#         path = self.wavs_and_paths[idx]['path']
+#         if self.max_len is not None:
+#             start = random.randint(0,  wav.shape[-1] - self.max_len)
+#             wav = wav[:, start : start + self.max_len]
+#         melspec = self.mel_creator(wav.detach()).squeeze(0)
+#         return {"wav": wav, 'path' : path, 'melspec' : melspec}
+
+
+def get_dataset_filelist(dataset_split_file, input_wavs_dir):
+    with open(dataset_split_file, "r", encoding="utf-8") as fi:
+        files = [
+            os.path.join(input_wavs_dir, fn)
+            for fn in fi.read().split("\n")
+            if len(fn) > 0
+        ]
+    return files
+
+
+
+def low_pass_filter(audio: np.ndarray, low_sampling_rate,
+                    lp_type="default", high_sampling_rate=16000):
+    if lp_type == "default":
+        tmp = librosa.resample(
+            audio, orig_sr=high_sampling_rate, target_sr=low_sampling_rate * 2, res_type="polyphase"
+        )
+    elif lp_type == "decimate":
+        sub = high_sampling_rate / (low_sampling_rate * 2)
+        assert int(sub) == sub
+        tmp = scipy.signal.decimate(audio, int(sub))
+    else:
+        raise NotImplementedError
+    # soxr_hq is faster and better than polyphase,
+    # but requires additional libraries installed
+    # the speed difference is only 4 times, we can live with that
+    tmp = librosa.resample(tmp, orig_sr=low_sampling_rate * 2, target_sr=high_sampling_rate, res_type="polyphase")
+    return tmp[: audio.size]
+
+
+
+def split_audios(audios, segment_size, split):
+    audios = [torch.FloatTensor(audio).unsqueeze(0) for audio in audios]
+    if split:
+        if audios[0].size(1) >= segment_size:
+            max_audio_start = audios[0].size(1) - segment_size
+            audio_start = random.randint(0, max_audio_start)
+            audios = [
+                audio[:, audio_start : audio_start + segment_size]
+                for audio in audios
+            ]
+        else:
+            audios = [
+                torch.nn.functional.pad(
+                    audio,
+                    (0, segment_size - audio.size(1)),
+                    "constant",
+                )
+                for audio in audios
+            ]
+    audios = [audio.squeeze(0).numpy() for audio in audios]
+    return audios
 
 class VCTKDataset(BaseDataset):
-    """
-    VCTK Dataset implementation inheriting from BaseDataset.
-    This dataset handles VCTK audio files for speech processing tasks.
-    """
-
     def __init__(
-        self, dataset_split_file, vctk_wavs_dir, segment_size=8192, sampling_rate=16000, input_freq = 1000, window=4096,
-        split=True, shuffle=False, instance_transforms=None, limit=None
+        self,
+        dataset_split_file,
+        vctk_wavs_dir,
+        segment_size=8192,
+        high_sampling_rate=16000,
+        split=True,
+        shuffle=False,
+        device=None,
+        low_sampling_rate=None,
+        lowpass="default",
     ):
-        """
-        Args:
-            dataset_split_file (str): Path to the dataset split file.
-            vctk_wavs_dir (str): Directory where VCTK WAV files are stored.
-            segment_size (int): Size of each audio segment.
-            sampling_rate (int): Sampling rate for audio.
-            split (bool): Whether to split the audio into segments.
-            shuffle (bool): Whether to shuffle the dataset.
-            instance_transforms (dict | None): Dictionary of transforms to apply to instances.
-            limit (int | None): Maximum number of dataset elements to include.
-        """
-        self.segment_size = segment_size
-        self.sampling_rate = sampling_rate
-        self.input_freq = input_freq
-        self.split = split
-        self.window = window
-
-        self.audio_files = self._load_file_list(dataset_split_file, vctk_wavs_dir)
+        self.audio_files = get_dataset_filelist(dataset_split_file,
+                                                vctk_wavs_dir)
+        random.seed(1234)
         if shuffle:
             random.shuffle(self.audio_files)
-
-        index = self._create_index()
-        super().__init__(index, limit=limit, shuffle_index=False, instance_transforms=instance_transforms)
-
-    def _load_file_list(self, dataset_split_file, vctk_wavs_dir):
-        """Load list of audio file paths from dataset split file."""
-        with open(dataset_split_file, "r", encoding="utf-8") as f:
-            files = [os.path.join(vctk_wavs_dir, line.strip()) for line in f if line.strip()]
-        return files
-
-    def _create_index(self):
-        """Create index for dataset."""
-        return [{"path": file_path} for file_path in self.audio_files]
-
-    def load_object(self, path):
-        """Load an audio file from disk and preprocess it."""
-        audio, _ = librosa.load(path, sr=self.sampling_rate, res_type="polyphase")
-        audio = self.split_audios([audio], self.segment_size, self.split)[0]
-        return torch.FloatTensor(normalize(audio) * 0.95)
-
-    def split_audios(self, audios, segment_size, split=True):
-        """
-        Correctly splits audios into multiple segments of given size.
-
-        Args:
-            audios (list[np.ndarray] or list[torch.Tensor]): List of audio signals.
-            segment_size (int): Target segment size in samples.
-            split (bool): Whether to split the audio into multiple smaller segments.
-
-        Returns:
-            list[np.ndarray]: List of processed audio segments.
-        """
-        window = self.window
-
-        processed_audios = []
-        sizes = []
-
-        for audio in audios:
-            if isinstance(audio, np.ndarray):
-                audio = torch.FloatTensor(audio).unsqueeze(0)
-
-            audio_len = audio.size(1)
-
-            if split:
-                start = 0
-                while start + segment_size <= audio_len:
-                    print(start, start + segment_size)
-                    segment = audio[:, start:start + segment_size]
-                    processed_audios.append(segment.squeeze(0).numpy())
-                    start += window
-
-                par = start + segment_size - window
-
-                if start < audio_len:
-                    end_segment = audio[:, -segment_size:]
-                    processed_audios.append(end_segment.squeeze(0).numpy())
-                    sizes.append(audio_len - par)
-                    print(audio_len - par, sizes[0], audio_len)
-            else:
-                if audio_len < segment_size:
-                    pad_size = segment_size - audio_len
-                    audio = torch.nn.functional.pad(audio, (0, pad_size), mode="constant", value=0)
-                processed_audios.append(audio.squeeze(0).numpy())
-
-        print(f"Total segments created: {len(processed_audios)}")
-        return processed_audios, sizes
-
+        self.segment_size = segment_size
+        self.high_sampling_rate = high_sampling_rate
+        self.split = split
+        self.device = device
+        self.low_sampling_rate = low_sampling_rate
+        self.lowpass = lowpass
+        self.clean_wavs_dir = vctk_wavs_dir
+        self.mel_creator = MelSpectrogram(MelSpectrogramConfig())
 
     def __getitem__(self, index):
-        """
-        Get an item from the dataset.
-
-        Args:
-            index (int): Index of the dataset item.
-
-        Returns:
-            dict: Dictionary containing:
-                - 'input_audio': Processed low-pass filtered audio.
-                - 'audio': Original normalized audio.
-        """
         vctk_fn = self.audio_files[index]
-        vctk_audio, _ = librosa.load(vctk_fn, sr=self.sampling_rate, res_type="polyphase")
 
-        audio_segments, sizes = self.split_audios([vctk_audio], self.segment_size, self.split)
+        vctk_audio = librosa.load(
+            vctk_fn,
+            sr=self.high_sampling_rate,
+            res_type="polyphase",
+        )[0]
+        (vctk_audio, ) = split_audios([vctk_audio],
+                                      self.segment_size, self.split)
 
-        batch = []
-        for segment in audio_segments:
-            lp_inp = self.low_pass_filter(
-                                      segment, self.input_freq,
-                                      lp_type="default", orig_sr=self.sampling_rate
-                                    )
+        lp_inp = low_pass_filter(
+            vctk_audio, low_sampling_rate=self.low_sampling_rate,
+            lp_type=self.lowpass, high_sampling_rate=self.high_sampling_rate
+        )
+        input_audio = normalize(lp_inp)[None] * 0.95
+        assert input_audio.shape[1] == vctk_audio.size
 
-            input_audio = torch.FloatTensor(normalize(lp_inp)[None] * 0.95)  # (1, N)
-            audio = torch.FloatTensor(normalize(segment) * 0.95).unsqueeze(0)  # (1, N)
+        input_audio = torch.FloatTensor(input_audio)
+        gt_audio = torch.FloatTensor(normalize(vctk_audio) * 0.95)
+        gt_audio = gt_audio.unsqueeze(0)
+        # audio = torch.FloatTensor(normalize(vctk_audio) * 0.95)
+        # audio = audio.unsqueeze(0)
+        # input_audio = torch.nn.functional.pad(input_audio, (0, self.segment_size - input_audio.size(1)), 'constant')
+        # audio = torch.nn.functional.pad(audio, (0, self.segment_size - audio.size(1)), 'constant')
+        melspec = self.mel_creator(input_audio.detach()).squeeze(0)
+        melspec_gt = self.mel_creator(gt_audio.detach()).squeeze(0)
 
-            batch.append({"audio": input_audio, "tg_audio": audio, "file_id": index, "size": sizes[0]})
-
-        return batch
+        return {"wav": input_audio, 'path' : vctk_fn, 'melspec' : melspec, "gt_wav": gt_audio, 'gt_melspec': melspec_gt}
+        # return input_audio, audio
 
     def __len__(self):
         return len(self.audio_files)
 
-    @staticmethod
-    def low_pass_filter(audio, max_freq, orig_sr=16000, lp_type="default"):
-        """
-        Apply a low-pass filter to the input audio.
-
-        Args:
-            audio (np.ndarray): Input audio.
-            max_freq (int): Max frequency cutoff.
-            orig_sr (int): Original sample rate.
-            lp_type (str): Type of low-pass filter.
-
-        Returns:
-            np.ndarray: Filtered audio.
-        """
-        if lp_type == "default":
-            tmp = librosa.resample(audio, orig_sr=orig_sr, target_sr=max_freq * 2, res_type="polyphase")
-        elif lp_type == "decimate":
-            sub = orig_sr / (max_freq * 2)
-            if not sub.is_integer():
-                raise ValueError("Decimation factor must be an integer.")
-            tmp = signal.decimate(audio, int(sub))
-        else:
-            raise NotImplementedError("Unknown low-pass filter type.")
-
-        return librosa.resample(tmp, orig_sr=max_freq * 2, target_sr=orig_sr, res_type="polyphase")[: len(audio)]

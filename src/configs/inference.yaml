@@ -1,14 +1,12 @@
 defaults:
-  - model: hifiplusplus
-  - metrics: vctk_dataset
-  - datasets: vctk_dataset
-  - dataloader: example
-  - transforms: example_only_instance
+  - model: hifigan
+  - metrics: mos_metric
+  - datasets: config_for_test
+  - dataloader: test_loader
+  - transforms: no_transforms
   - _self_
 inferencer:
-  device_tensors: ["audio"] # which tensors should be on device (ex. GPU)
-  device: auto # device name or "auto"
-  save_path: "example" # any name here, can be a dataset name
+  device_tensors: ["wav", "melspec"]
+  device: auto
+  save_path: "inference_dir"
   seed: 1
-  from_pretrained: "/content/Course_work_2/data/VCTK/bwe1.pth" # path to the pretrained model
-  window: 4096

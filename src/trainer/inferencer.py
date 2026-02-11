@@ -1,15 +1,12 @@
-
 import torch
-import torchaudio
 from tqdm.auto import tqdm
-import soundfile as sf
-import numpy as np
-import librosa
 
 from src.metrics.tracker import MetricTracker
 from src.trainer.base_trainer import BaseTrainer
-from src.metrics.rtf import RTF
-from src.metrics.thop import THOPMetric
+import numpy as np
+import torchaudio
+from pathlib import Path
+from src.metrics.calculate_metrics import calculate_all_metrics
 
 
 class Inferencer(BaseTrainer):
@@ -22,15 +19,15 @@ class Inferencer(BaseTrainer):
     """
 
     def __init__(
-            self,
-            model,
-            config,
-            device,
-            dataloaders,
-            save_path,
-            metrics=None,
-            batch_transforms=None,
-            skip_model_load=False,
+        self,
+        model,
+        config,
+        device,
+        dataloaders,
+        save_path,
+        metrics=None,
+        batch_transforms=None,
+        skip_model_load=False,
     ):
         """
         Initialize the Inferencer.
@@ -41,6 +38,7 @@ class Inferencer(BaseTrainer):
             device (str): device for tensors and model.
             dataloaders (dict[DataLoader]): dataloaders for different
                 sets of data.
+            text_encoder (CTCTextEncoder): text encoder.
             save_path (str): path to save model predictions and other
                 information.
             metrics (dict): dict with the definition of metrics for
@@ -55,7 +53,7 @@ class Inferencer(BaseTrainer):
                 Inferencer Class.
         """
         assert (
-                skip_model_load or config.inferencer.get("from_pretrained") is not None
+            skip_model_load or config.inferencer.get("from_pretrained") is not None
         ), "Provide checkpoint or set skip_model_load=True"
 
         self.config = config
@@ -66,10 +64,12 @@ class Inferencer(BaseTrainer):
         self.model = model
         self.batch_transforms = batch_transforms
 
+
         # define dataloaders
         self.evaluation_dataloaders = {k: v for k, v in dataloaders.items()}
 
         # path definition
+
         self.save_path = save_path
 
         # define metrics
@@ -102,93 +102,63 @@ class Inferencer(BaseTrainer):
 
     def process_batch(self, batch_idx, batch, metrics, part):
         """
-        Run batch through the model, compute metrics, and save predictions to disk.
+        Run batch through the model, compute metrics, and
+        save predictions to disk.
 
-        - Moves batch to device.
-        - Processes multiple small segments and merges them back into full audio.
-        - Saves predictions as audio files.
+        Save directory is defined by save_path in the inference
+        config and current partition.
+
+        Args:
+            batch_idx (int): the index of the current batch.
+            batch (dict): dict-based batch containing the data from
+                the dataloader.
+            metrics (MetricTracker): MetricTracker object that computes
+                and aggregates the metrics. The metrics depend on the type
+                of the partition (train or inference).
+            part (str): name of the partition. Used to define proper saving
+                directory.
+        Returns:
+            batch (dict): dict-based batch containing the data from
+                the dataloader (possibly transformed via batch transform)
+                and model outputs.
         """
+        # TODO change inference logic so it suits ASR assignment
+        # and task pipeline
 
         batch = self.move_batch_to_device(batch)
-        batch = self.transform_batch(batch)
+        batch = self.transform_batch(batch)  # transform batch on device -- faster
 
-        x_segments = batch["audio"]  # (batch_size, 1, segment_size)
-        wq = batch["tg_audio"]
-        print(f"Input batch shape: {wq.shape}")
+        if 'wav' not  in batch.keys():
+            generated_wavs = self.model.generator(batch['generated_from_text_melspec'].squeeze(1))
+        else:
+            generated_wavs = self.model.generator(batch['wav'])
+        batch['generated_wav'] = generated_wavs
 
-        outputs = self.model(x_segments)
-        print(f"Model output shape: {outputs.shape}")
-
-        if not isinstance(outputs, dict):
-            outputs = {"pred_audio": outputs}
-
-        batch.update(outputs)
-        # Update RTF separately
-        for met in self.metrics["inference"]:
-            if isinstance(met, RTF):
-                try:
-                    met.update(self.model, batch["audio"])
-                except Exception:
-                    continue
-            if isinstance(met, THOPMetric):
-                met.update(self.model, batch["audio"])
 
         if metrics is not None:
+            calculate_all_metrics(batch['generated_wav'], batch['wav'], self.metrics["inference"], self.config.datasets.test.input_freq, self.config.datasets.test.sampling_rate)
             for met in self.metrics["inference"]:
-                print(batch["pred_audio"].shape[0])
-                for i in range(batch["pred_audio"].shape[0]):
-                    source = batch["tg_audio"][i].squeeze().cpu().numpy()
-                    predict = batch["pred_audio"][i].squeeze().cpu().numpy()
-                    source = librosa.util.normalize(source[:min(len(source), len(predict))])
-                    predict = librosa.util.normalize(predict[:min(len(source), len(predict))])
+                metrics.update(met.name, np.mean(met.result['mean']))
+                # met.result['mean'] = []
+                # met.result['std'] = []
 
-                    source = torch.from_numpy(source)[None, None]
-                    predict = torch.from_numpy(predict)[None, None]
+        # Some saving logic. This is an example
+        # Use if you need to save predictions on disk
 
-                    try:
-                        metric_value = met(source, predict)
-                        metrics.update(met.name, metric_value)
-                    except Exception as e:
-                        continue
+        batch_size = batch["generated_wav"].shape[0]
 
-        batch_size = batch["pred_audio"].shape[0]
-
-        audio_dict = {}
-        marg_dict = {}
         for i in range(batch_size):
-            file_id = batch["file_id"][i]
-            logits = batch["pred_audio"][i].clone().cpu().numpy()
+            # clone because of
+            # https://github.com/pytorch/pytorch/issues/1995
+            generated_wavs = batch["generated_wav"][i].detach().clone()
+            path_to_save =  batch["path"][i]
 
-            if file_id not in audio_dict:
-                audio_dict[file_id] = []
-            audio_dict[file_id].append(logits)
-            marg_dict[file_id] = batch["size"]
-
-        for file_id, segments in audio_dict.items():
-            merged_audio = []
-
-            for i, segment in enumerate(segments):
-                
-                if i == 0:
-                    merged_audio.append(segment)
-                elif i != (len(segments)-1):
-                    merged_audio.append(segment[:,-self.cfg_trainer.window:])
+            if self.save_path is not None:
+                # you can use safetensors or other lib here
+                if path_to_save is not None:
+                    torchaudio.save(self.save_path / part /  f"{str(Path(path_to_save).stem)}.wav", generated_wavs.detach().to(torch.device('cpu')), sample_rate=self.config.datasets.test.sampling_rate)
                 else:
-                    merged_audio.append(segment[:, -marg_dict[file_id]:])
-                    print(-marg_dict[file_id])
-
-            full_audio = np.concatenate(merged_audio, axis=-1)
-            full_audio_tensor = torch.FloatTensor(full_audio)
-
-            if full_audio_tensor.dim() == 1:
-                full_audio_tensor = full_audio_tensor.unsqueeze(0)
-
-            torchaudio.save(
-                self.save_path / part / f"output_{file_id}.wav",
-                full_audio_tensor,
-                16000,
-                channels_first=True,
-            )
+                    torchaudio.save(self.save_path / part /  "wav_from_text_from_console.wav", generated_wavs.detach().to(torch.device('cpu')), sample_rate=self.config.datasets.test.sampling_rate)
 
         return batch
 
@@ -204,7 +174,7 @@ class Inferencer(BaseTrainer):
         """
 
         self.is_train = False
-        self.model.eval()
+        self.model.generator.eval()
 
         self.evaluation_metrics.reset()
 
@@ -214,9 +184,9 @@ class Inferencer(BaseTrainer):
 
         with torch.no_grad():
             for batch_idx, batch in tqdm(
-                    enumerate(dataloader),
-                    desc=part,
-                    total=len(dataloader),
+                enumerate(dataloader),
+                desc=part,
+                total=len(dataloader),
             ):
                 batch = self.process_batch(
                     batch_idx=batch_idx,
@@ -226,4 +196,4 @@ class Inferencer(BaseTrainer):
                 )
 
         return self.evaluation_metrics.result()
-
+    

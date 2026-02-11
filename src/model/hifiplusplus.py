@@ -7,17 +7,115 @@ import src.utils.nn_utils as nn_utils
 from src.utils.hifi_utils import mel_spectrogram
 import src.utils.hifi_utils
 
-class HiFiPlusGenerator(torch.nn.Module):
+from typing import Literal
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.utils import weight_norm, spectral_norm
+import src.utils.nn_utils as nn_utils
+from librosa.filters import mel as librosa_mel_fn
+import numpy as np
+
+
+
+def amp_pha_stft(audio, n_fft, hop_size, win_size, center=True):
+
+    hann_window = torch.hann_window(win_size).to(audio.device)
+    stft_spec = torch.stft(audio, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window,
+                           center=center, pad_mode='reflect', normalized=False, return_complex=True)
+    log_amp = torch.log(torch.abs(stft_spec)+1e-4)
+    pha = torch.angle(stft_spec)
+
+    com = torch.stack((torch.exp(log_amp)*torch.cos(pha), 
+                       torch.exp(log_amp)*torch.sin(pha)), dim=-1)
+
+    return log_amp, pha, com
+
+
+def amp_pha_istft(log_amp, pha, n_fft, hop_size, win_size, center=True):
+    
+    amp = torch.exp(log_amp)
+    com = torch.complex(amp*torch.cos(pha), amp*torch.sin(pha))
+    hann_window = torch.hann_window(win_size).to(com.device)
+    audio = torch.istft(com, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window, center=center)
+
+    return audio
+
+mel_basis = {}
+hann_window = {}
+
+def dynamic_range_compression_torch(x, C=1, clip_val=1e-5):
+    return torch.log(torch.clamp(x, min=clip_val) * C)
+
+def spectral_normalize_torch(magnitudes):
+    output = dynamic_range_compression_torch(magnitudes)
+    return output
+
+def mel_spectrogram(
+    y,
+    n_fft,
+    num_mels,
+    sampling_rate,
+    hop_size,
+    win_size,
+    fmin,
+    fmax,
+    center=False,
+    return_mel_and_spec=False,
+):
+    if isinstance(y, np.ndarray):
+        y = torch.from_numpy(y).unsqueeze(0)
+
+    global mel_basis, hann_window
+    if fmax not in mel_basis:
+        mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels,
+                             fmin=fmin, fmax=fmax)
+        mel_basis[str(fmax) + "_" + str(y.device)] = (
+            torch.from_numpy(mel).float().to(y.device)
+        )
+        hann_window[str(y.device)] = torch.hann_window(win_size).to(y.device)
+
+    y = torch.nn.functional.pad(
+        y.unsqueeze(1),
+        (int((n_fft - hop_size) / 2), int((n_fft - hop_size) / 2)),
+        mode="reflect",
+    )
+    y = y.squeeze(1)
+
+    spec = torch.stft(
+        y,
+        n_fft,
+        hop_length=hop_size,
+        win_length=win_size,
+        window=hann_window[str(y.device)],
+        center=center,
+        pad_mode="reflect",
+        normalized=False,
+        onesided=True,
+        return_complex=False,
+    )
+    spec = torch.sqrt(spec.pow(2).sum(-1) + 1e-9)
+
+    mel = torch.matmul(mel_basis[str(fmax) + "_" + str(y.device)], spec)
+    mel = spectral_normalize_torch(mel)
+    result = mel.squeeze()
+
+    if return_mel_and_spec:
+        spec = spectral_normalize_torch(spec)
+        return result, spec
+    else:
+        return result
+
+
+
+
+def closest_power_of_two(n):
+    return 1 << (n - 1).bit_length()
+
+
+class HiFiPlusGeneratorBWE(torch.nn.Module):
     def __init__(
         self,
-        hifi_resblock="1",
-        hifi_upsample_rates=(8, 8, 2, 2),
-        hifi_upsample_kernel_sizes=(16, 16, 4, 4),
-        hifi_upsample_initial_channel=128,
-        hifi_resblock_kernel_sizes=(3, 7, 11),
-        hifi_resblock_dilation_sizes=((1, 3, 5), (1, 3, 5), (1, 3, 5)),
-        hifi_input_channels=128,
-        hifi_conv_pre_kernel_size=1,
 
         use_spectralunet=True,
         spectralunet_block_widths=(8, 16, 24, 32, 64),
@@ -35,8 +133,18 @@ class HiFiPlusGenerator(torch.nn.Module):
         norm_type: Literal["weight", "spectral"] = "weight",
         use_skip_connect=True,
         waveunet_before_spectralmasknet=True,
+        ConvNeXt_channels = 512,
+        ConvNeXt_layers = 8,
+        n_fft = 256, 
+        hop_size = 80,
+        win_size = 320,
+
     ):
         super().__init__()
+
+        self.n_fft = n_fft
+        self.hop_size = hop_size
+        self.win_size = win_size
         self.norm = dict(weight=weight_norm, spectral=spectral_norm)[norm_type]
         self.norm_type = norm_type
 
@@ -47,18 +155,10 @@ class HiFiPlusGenerator(torch.nn.Module):
         self.use_skip_connect = use_skip_connect
         self.waveunet_before_spectralmasknet = waveunet_before_spectralmasknet
 
-        self.hifi = nn_utils.HiFiGeneratorBackbone(
-            resblock=hifi_resblock,
-            upsample_rates=hifi_upsample_rates,
-            upsample_kernel_sizes=hifi_upsample_kernel_sizes,
-            upsample_initial_channel=hifi_upsample_initial_channel,
-            resblock_kernel_sizes=hifi_resblock_kernel_sizes,
-            resblock_dilation_sizes=hifi_resblock_dilation_sizes,
-            input_channels=hifi_input_channels,
-            conv_pre_kernel_size=hifi_conv_pre_kernel_size,
-            norm_type=norm_type,
-        )
-        ch = self.hifi.out_channels
+        self.bwe_blocks = nn_utils.APNet_BWE_Model(ConvNeXt_channels=ConvNeXt_channels, ConvNeXt_layers=ConvNeXt_layers, n_fft=n_fft)
+
+        # ch = self.hifi.out_channels
+        ch = 8
 
         if self.use_spectralunet:
             self.spectralunet = nn_utils.SpectralUNet(
@@ -112,7 +212,7 @@ class HiFiPlusGenerator(torch.nn.Module):
     def apply_spectralunet(self, x_orig):
         if self.use_spectralunet:
             pad_size = (
-                nn_utils.closest_power_of_two(x_orig.shape[-1]) - x_orig.shape[-1]
+                closest_power_of_two(x_orig.shape[-1]) - x_orig.shape[-1]
             )
             x = torch.nn.functional.pad(x_orig, (0, pad_size))
             x = self.spectralunet(x)
@@ -137,7 +237,11 @@ class HiFiPlusGenerator(torch.nn.Module):
 
     def forward(self, x_orig):
         x = self.apply_spectralunet(x_orig)
-        x = self.hifi(x)
+        mag, pha, com = amp_pha_stft(x, self.n_fft, self.hop_size, self.win_size)
+            
+        mag_wb_g, pha_wb_g, com_wb_g = self.bwe_blocks(mag, pha)
+
+        x = amp_pha_istft(mag_wb_g, pha_wb_g, self.n_fft, self.hop_size, self.win_size)
         if self.use_waveunet and self.waveunet_before_spectralmasknet:
             x = self.apply_waveunet(x)
         if self.use_spectralmasknet:
@@ -150,18 +254,10 @@ class HiFiPlusGenerator(torch.nn.Module):
 
         return x
 
-
-class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
+class A2AHiFiPlusGeneratorBWEV2(HiFiPlusGeneratorBWE):
     def __init__(
         self,
-        hifi_resblock="1",
-        hifi_upsample_rates=(8, 8, 2, 2),
-        hifi_upsample_kernel_sizes=(16, 16, 4, 4),
-        hifi_upsample_initial_channel=128,
-        hifi_resblock_kernel_sizes=(3, 7, 11),
-        hifi_resblock_dilation_sizes=((1, 3, 5), (1, 3, 5), (1, 3, 5)),
-        hifi_input_channels=128,
-        hifi_conv_pre_kernel_size=1,
+
 
         use_spectralunet=True,
         spectralunet_block_widths=(8, 16, 24, 32, 64),
@@ -183,15 +279,6 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
         waveunet_input: Literal["waveform", "hifi", "both"] = "both",
     ):
         super().__init__(
-            hifi_resblock=hifi_resblock,
-            hifi_upsample_rates=hifi_upsample_rates,
-            hifi_upsample_kernel_sizes=hifi_upsample_kernel_sizes,
-            hifi_upsample_initial_channel=hifi_upsample_initial_channel,
-            hifi_resblock_kernel_sizes=hifi_resblock_kernel_sizes,
-            hifi_resblock_dilation_sizes=hifi_resblock_dilation_sizes,
-            hifi_input_channels=hifi_input_channels,
-            hifi_conv_pre_kernel_size=hifi_conv_pre_kernel_size,
-
             use_spectralunet=use_spectralunet,
             spectralunet_block_widths=spectralunet_block_widths,
             spectralunet_block_depth=spectralunet_block_depth,
@@ -216,13 +303,15 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
         if self.waveunet_input == "waveform":
             self.waveunet_conv_pre = weight_norm(
                 nn.Conv1d(
-                    1, self.hifi.out_channels, 1
+                    # 1, self.hifi.out_channels, 1
+                    1, 8, 1
                 )
             )
         elif self.waveunet_input == "both":
             self.waveunet_conv_pre = weight_norm(
                 nn.Conv1d(
-                    1 + self.hifi.out_channels, self.hifi.out_channels, 1
+                    # 1 + self.hifi.out_channels, self.hifi.out_channels, 1
+                    1 + 8, 8, 1
                 )
             )
         
@@ -234,14 +323,6 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
         x = x.view(shape[0], -1, x.shape[-1])
         return x
     
-    @staticmethod
-    def get_spec(x):
-        shape = x.shape
-        x = x.view(shape[0] * shape[1], shape[2])
-        x = mel_spectrogram(x, 1024, 80, 16000, 256,
-                            1024, 0, 8000, return_mel_and_spec=True)[1]
-        x = x.view(shape[0], -1, x.shape[-1])
-        return x
 
     def apply_waveunet_a2a(self, x, x_orig):
         if self.waveunet_input == "waveform":
@@ -262,8 +343,17 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
         x_orig = x.clone()
         x_orig = x_orig[:, :, : x_orig.shape[2] // 1024 * 1024]
         x = self.get_melspec(x_orig)
+
         x = self.apply_spectralunet(x)
-        x = self.hifi(x)
+
+        pha = torch.angle(x)
+        log_amp = torch.log(torch.abs(x)+1e-4)
+        
+        mag_wb_g, pha_wb_g, com_wb_g = self.bwe_blocks(log_amp, pha)
+
+        x_orig = amp_pha_istft(mag_wb_g, pha_wb_g, 1024, 256, 1024)
+        x_orig = x_orig.unsqueeze(1)
+
         if self.use_waveunet and self.waveunet_before_spectralmasknet:
             x = self.apply_waveunet_a2a(x, x_orig)
         if self.use_spectralmasknet:
@@ -275,3 +365,134 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
         x = torch.tanh(x)
 
         return x
+
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class SubMultiPeriodDiscriminator(nn.Module):
+    def __init__(self, period, kernel_size, stride, channels):
+        super().__init__()
+        self.period = period
+        conv_layers = []
+        norm = nn.utils.parametrizations.weight_norm
+        for i in range(len(channels) - 1):
+            conv_layers.append(nn.Sequential(norm(nn.Conv2d(in_channels=channels[i], out_channels=channels[i + 1],\
+                                                                       kernel_size=(kernel_size, 1), stride=(stride, 1), \
+                                                                        padding=(2, 0))), nn.LeakyReLU(0.1)))
+        self.conv_blocks = nn.ModuleList(conv_layers)
+        self.conv1 =  nn.Sequential(norm(nn.Conv2d(in_channels=channels[-1], out_channels=1024, kernel_size=(5, 1), padding="same")), \
+                                    nn.LeakyReLU(0.1))
+        self.res_conv = norm(nn.Conv2d(in_channels=1024,out_channels=1,kernel_size=(3, 1),padding="same"))
+
+
+    def make1d_to2d(self, x):
+        if x.shape[-1] % self.period != 0:
+            n_pad = self.period - (x.shape[-1] % self.period)
+            x = F.pad(x, (0, n_pad), "reflect")
+        return x.view(x.shape[0], 1, x.shape[-1] // self.period, self.period)
+
+    def forward(self, x):
+        feats = []
+        x = self.make1d_to2d(x)
+        for layer in self.conv_blocks:
+            x = layer(x)
+            feats.append(x)
+        x = self.conv1(x)
+        feats.append(x)
+        x = self.res_conv(x)
+        feats.append(x)
+        return x.flatten(-2, -1), feats
+
+
+class MultiPeriodDiscriminator(nn.Module):
+    def __init__(self, periods, kernel_size, stride, channels):
+        super().__init__()
+        self.sub_discriminators = nn.ModuleList([SubMultiPeriodDiscriminator(period=period,kernel_size=kernel_size, \
+                                                                             stride=stride,channels=channels)for period in periods])
+
+
+    def forward(self, x_gt, x_gen):
+        disc_outputs_gt = []
+        disc_outputs_fake = []
+        disc_features_gt = []
+        disc_features_fake = []
+        for disc in self.sub_discriminators:
+            output_gt, features_list_gt = disc(x_gt)
+            output_fake, features_list_fake = disc(x_gen)
+            disc_outputs_gt.append(output_gt)
+            disc_outputs_fake.append(output_fake)
+            disc_features_gt.append(features_list_gt)
+            disc_features_fake.append(features_list_fake)
+        return disc_outputs_gt, disc_features_gt, disc_outputs_fake, disc_features_fake
+
+import torch.nn as nn
+
+
+class SubMultiScaleDiscriminator(nn.Module):
+    def __init__(self,  kernel_sizes, strides, groups, channels, use_spectral=False):
+        super().__init__()
+        layers = []
+        norm = nn.utils.spectral_norm if use_spectral else nn.utils.parametrizations.weight_norm
+        for i in range(len(kernel_sizes)):
+            layers.append(nn.Sequential(norm(nn.Conv1d(in_channels=channels[i], out_channels=channels[i + 1], kernel_size=kernel_sizes[i], \
+                                                              stride=strides[i], groups=groups[i], padding=(kernel_sizes[i] - 1) // 2)), nn.LeakyReLU(0.1)))
+
+        layers.append(norm(nn.Conv1d( in_channels=channels[-1], out_channels=1, kernel_size=3, stride=1, padding=1)))
+
+        self.layers = nn.ModuleList(layers)
+
+
+    def forward(self, x):
+        feats = []
+        for layer in self.layers:
+            x = layer(x)
+            feats.append(x)
+        return x, feats
+
+
+class MultiScaleDiscriminator(nn.Module):
+    def __init__(self, num_blocks, kernel_sizes, strides, groups, channels):
+        super().__init__()
+        self.discriminators = nn.ModuleList([SubMultiScaleDiscriminator( kernel_sizes=kernel_sizes, strides=strides, groups=groups, \
+                                                                        channels=channels, use_spectral=(i == 0)) for i in range(num_blocks)])
+        self.pooling = nn.ModuleList([nn.AvgPool1d(4, 2, padding=2),nn.AvgPool1d(4, 2, padding=2)])
+
+    def forward(self, x_gt, x_fake):
+        disc_gt_outputs = []
+        disc_gt_features = []
+        disc_fake_outputs = []
+        disc_fake_features = []
+        for i, disc in enumerate(self.discriminators):
+            if i != 0:
+                x_gt = self.pooling[i-1](x_gt)
+                x_fake = self.pooling[i-1](x_fake)
+            output_gt, features_list_gt = disc(x_gt)
+            disc_gt_outputs.append(output_gt)
+            disc_gt_features.append(features_list_gt)
+            output_fake, features_list_fake = disc(x_fake)
+            disc_fake_outputs.append(output_fake)
+            disc_fake_features.append(features_list_fake)
+        return disc_gt_outputs, disc_gt_features, disc_fake_outputs, disc_fake_features
+
+    
+class HiFiGAN(nn.Module):
+    def __init__(self,
+                 generator_config, 
+                 mpd_config,
+                 msd_config):
+        super().__init__()
+        self.generator = A2AHiFiPlusGeneratorV4(**generator_config)
+        self.mpd = MultiPeriodDiscriminator(**mpd_config)
+        self.msd = MultiScaleDiscriminator(**msd_config)
+
+
+    def __str__(self):
+        all_parameters = sum([p.numel() for p in self.parameters()])
+        trainable_parameters = sum(
+            [p.numel() for p in self.parameters() if p.requires_grad]
+        )
+        result_info = super().__str__()
+        result_info = result_info + f"\nAll parameters: {all_parameters}"
+        result_info = result_info + f"\nTrainable parameters: {trainable_parameters}"
+        return result_info

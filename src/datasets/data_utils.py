@@ -1,8 +1,8 @@
 from itertools import repeat
-import importlib
 
 from hydra.utils import instantiate
 
+from src.datasets.collate import collate_fn
 from src.utils.init_utils import set_worker_seed
 
 
@@ -36,58 +36,54 @@ def move_batch_transforms_to_device(batch_transforms, device):
             tensor name.
         device (str): device to use for batch transforms.
     """
-    if batch_transforms is None:
-        return
+    for transform_type in batch_transforms.keys():
+        transforms = batch_transforms.get(transform_type)
+        if transforms is not None:
+            for transform_name in transforms.keys():
+                transforms[transform_name] = transforms[transform_name].to(device)
 
-    for transform_type, transforms in batch_transforms.items():
-        if transforms is None:
-            continue
-        
-        for transform_name, transform in transforms.items():
-            if isinstance(transform, torch.nn.Module):
-                transforms[transform_name] = transform.to(device)
 
 def get_dataloaders(config, device):
     """
-    Create dataloaders for each dataset partition.
-    Also initializes instance and batch transforms.
+    Create dataloaders for each of the dataset partitions.
+    Also creates instance and batch transforms.
 
     Args:
-        config (DictConfig): Hydra experiment config.
-        device (str): Device to use for batch transforms.
-
+        config (DictConfig): hydra experiment config.
+        text_encoder (CTCTextEncoder): instance of the text encoder
+            for the datasets.
+        device (str): device to use for batch transforms.
     Returns:
-        dataloaders (dict[DataLoader]): Dictionary containing dataloaders.
-        batch_transforms (dict[Callable] | None): Batch-level transformations.
+        dataloaders (dict[DataLoader]): dict containing dataloader for a
+            partition defined by key.
+        batch_transforms (dict[Callable] | None): transforms that
+            should be applied on the whole batch. Depend on the
+            tensor name.
     """
-    # Initialize batch transforms
+    # transforms or augmentations init
     batch_transforms = instantiate(config.transforms.batch_transforms)
     move_batch_transforms_to_device(batch_transforms, device)
 
-    # Dynamically load collate_fn from string path in config
-    collate_fn = None
-    if "collate_fn" in config.dataloader and isinstance(config.dataloader.collate_fn, str):
-        module_name, function_name = config.dataloader.collate_fn.rsplit(".", 1)
-        module = importlib.import_module(module_name)
-        collate_fn = getattr(module, function_name)
-
-    # Initialize dataloaders
+    # dataloaders init
     dataloaders = {}
     for dataset_partition in config.datasets.keys():
-        dataset = instantiate(config.datasets[dataset_partition])  # Instantiate dataset
+        # dataset partition init
+        dataset = instantiate(
+            config.datasets[dataset_partition]
+        )  # instance transforms are defined inside
 
-        assert config.dataloader.batch_size <= len(dataset), (
-            f"Batch size ({config.dataloader.batch_size}) cannot "
-            f"be larger than dataset size ({len(dataset)})"
+        assert config.dataloader[dataset_partition].batch_size <= len(dataset), (
+            f"The batch size ({config.dataloader[dataset_partition].batch_size}) cannot "
+            f"be larger than the dataset length ({len(dataset)})"
         )
 
         partition_dataloader = instantiate(
-            config.dataloader,
+            config.dataloader[dataset_partition],
             dataset=dataset,
+            collate_fn=collate_fn,
             drop_last=(dataset_partition == "train"),
             shuffle=(dataset_partition == "train"),
             worker_init_fn=set_worker_seed,
-            collate_fn=collate_fn,  # Добавляем кастомный collate_fn
         )
         dataloaders[dataset_partition] = partition_dataloader
 

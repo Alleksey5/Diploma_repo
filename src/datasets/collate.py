@@ -1,50 +1,66 @@
 import torch
 import torch.nn.functional as F
 
-def closest_power_of_two(n: int) -> int:
-    return 1 << (n - 1).bit_length()
 
-def custom_collate(batch):
-    audio_list, tg_list = [], []
-    audio_lens, tg_lens = [], []
-    file_ids, sizes = [], []
+def collate_fn(dataset_items: list[dict]):
+    """
+    Collate and pad fields in the dataset items.
+    Converts individual items into a batch.
 
-    for sample in batch:
-        for seg in sample:
-            a = seg["audio"]
-            t = seg["tg_audio"]
+    Args:
+        dataset_items (list[dict]): list of objects from
+            dataset.__getitem__.
+    Returns:
+        result_batch (dict[Tensor]): dict, containing batch-version
+            of the tensors.
+    """
 
-            # гарантируем форму (1, T) чтобы stack был предсказуемый
-            if a.dim() == 1:
-                a = a.unsqueeze(0)
-            if t.dim() == 1:
-                t = t.unsqueeze(0)
+    result_batch = {}
+    all_wavs = []
+    all_melspecs = []
+    max_len_wav = 0
+    max_len_spec = 0
+    paths = []
+    initial_lens = []
+    initial_melspec_lens = []
+    gt_wavs = []
+    gt_melspecs = []
+    max_len_gt_wav = 0
+    max_len_gt_spec = 0
+    initial_gt_lens = []
+    initial_gt_melspec_lens = []
 
-            audio_list.append(a)
-            tg_list.append(t)
 
-            audio_lens.append(a.shape[-1])
-            tg_lens.append(t.shape[-1])
+    for item in dataset_items:
+        paths.append(item['path'])
+        all_wavs.append(item['wav'].squeeze(0))
+        all_melspecs.append(item['melspec'])
+        max_len_wav = max(len(item['wav'].squeeze(0)), max_len_wav)
+        max_len_spec =  max(item['melspec'].shape[-1], max_len_spec)
+        initial_lens.append(item['wav'].shape[1])
+        initial_melspec_lens.append(item['melspec'].shape[-1])
+        gt_wavs.append(item['gt_wav'].squeeze(0))
+        gt_melspecs.append(item['gt_melspec'])
+        max_len_gt_wav = max(len(item['gt_wav'].squeeze(0)), max_len_gt_wav)
+        max_len_gt_spec =  max(item['gt_melspec'].shape[-1], max_len_gt_spec)
+        initial_gt_lens.append(item['gt_wav'].shape[1])
+        initial_gt_melspec_lens.append(item['gt_melspec'].shape[-1])
 
-            file_ids.append(seg.get("file_id", ""))
-            sizes.append(seg.get("size", 0))
+    result_batch['initial_len'] = initial_lens
+    result_batch['initial_gt_len'] = initial_gt_lens
+    
+    padded_wavs = torch.stack([F.pad(wav, (0, max_len_wav - wav.shape[0]), value=0) for wav in all_wavs])
+    result_batch['initial_melspec_len'] = initial_melspec_lens
+    padded_specs = torch.stack([F.pad(spec, (0, max_len_spec - spec.shape[-1], 0, 0)) for spec in all_melspecs])
+    result_batch['wav'] = padded_wavs.unsqueeze(1)
+    result_batch['melspec'] = padded_specs
 
-    max_len = max(max(audio_lens), max(tg_lens))
-    pad_len = closest_power_of_two(max_len)
 
-    def pad_right(x):
-        pad_size = pad_len - x.shape[-1]
-        return F.pad(x, (0, pad_size), value=0.0)
+    padded_gt_wavs = torch.stack([F.pad(wav, (0, max_len_gt_wav - wav.shape[0]), value=0) for wav in gt_wavs])
+    result_batch['initial_gt_melspec_len'] = initial_gt_melspec_lens
+    padded_gt_specs = torch.stack([F.pad(spec, (0, max_len_gt_spec - spec.shape[-1], 0, 0)) for spec in gt_melspecs])
+    result_batch['gt_wav'] = padded_gt_wavs.unsqueeze(1)
+    result_batch['gt_melspec'] = padded_gt_specs
 
-    audio = torch.stack([pad_right(x) for x in audio_list], dim=0)      # (B, 1, pad_len)
-    tg_audio = torch.stack([pad_right(x) for x in tg_list], dim=0)      # (B, 1, pad_len)
-
-    return {
-        "audio": audio,
-        "tg_audio": tg_audio,
-        "audio_len": torch.tensor(audio_lens, dtype=torch.long),  # (B,)
-        "tg_len": torch.tensor(tg_lens, dtype=torch.long),        # (B,)
-        "file_id": file_ids,
-        "size": sizes,
-        "pad_len": pad_len,
-    }
+    result_batch['path'] = paths
+    return result_batch
