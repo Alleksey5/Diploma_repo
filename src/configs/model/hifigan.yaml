@@ -1,4 +1,4 @@
-_target_: src.model.HiFiGAN  
+_target_: src.model.hifigan.HiFiGAN  
 generator_config:
   hifi_resblock: "1"
   hifi_upsample_rates: [8, 8, 2, 2]
