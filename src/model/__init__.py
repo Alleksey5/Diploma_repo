@@ -1,5 +1,8 @@
-from src.model.baseline_model import BaselineModel
+from src.model.hifigan import HiFiGAN
+from src.model.melspec import MelSpectrogramConfig, MelSpectrogram
 
 __all__ = [
-    "BaselineModel",
+    'MelSpectrogramConfig',
+    'MelSpectrogram',
+    'HiFiGAN'
 ]

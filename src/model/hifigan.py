@@ -482,7 +482,7 @@ class HiFiGAN(nn.Module):
                  mpd_config,
                  msd_config):
         super().__init__()
-        self.generator = A2AHiFiPlusGeneratorV4(**generator_config)
+        self.generator = A2AHiFiPlusGeneratorBWEV2(**generator_config)
         self.mpd = MultiPeriodDiscriminator(**mpd_config)
         self.msd = MultiScaleDiscriminator(**msd_config)
 
