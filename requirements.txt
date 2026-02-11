@@ -1,8 +1,8 @@
-torch==2.2.0
-torchvision==0.17.0
-torchaudio==2.2.0
+torch
+torchvision
+torchaudio
 soundfile
-numpy==1.26.4
+numpy
 torch_audiomentations
 tqdm
 matplotlib
@@ -10,6 +10,10 @@ pandas
 wandb
 comet_ml
 hydra-core
+pystoi 
+ptflops 
+omegaconf 
+pesq
 
 black
 isort
