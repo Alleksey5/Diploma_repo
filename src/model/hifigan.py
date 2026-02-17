@@ -135,9 +135,9 @@ class HiFiPlusGeneratorBWE(torch.nn.Module):
         waveunet_before_spectralmasknet=True,
         ConvNeXt_channels = 512,
         ConvNeXt_layers = 8,
-        n_fft = 256, 
-        hop_size = 80,
-        win_size = 320,
+        n_fft = 1024, 
+        hop_size = 256,
+        win_size = 1024,
 
     ):
         super().__init__()
@@ -340,30 +340,49 @@ class A2AHiFiPlusGeneratorBWEV2(HiFiPlusGeneratorBWE):
         return x
 
     def forward(self, x):
-        x_orig = x.clone()
+        x_orig = x
         x_orig = x_orig[:, :, : x_orig.shape[2] // 1024 * 1024]
-        x = self.get_melspec(x_orig)
 
-        x = self.apply_spectralunet(x)
+        wav_1d = x_orig.squeeze(1)
+        log_mag, pha, _ = amp_pha_stft(
+            wav_1d,
+            n_fft=self.n_fft,
+            hop_size=self.hop_size,
+            win_size=self.win_size,
+            center=True,
+        )
+        mag_wb_g, pha_wb_g, _ = self.bwe_blocks(log_mag, pha)  # [B, 513, frames]
 
-        pha = torch.angle(x)
-        log_amp = torch.log(torch.abs(x)+1e-4)
-        
-        mag_wb_g, pha_wb_g, com_wb_g = self.bwe_blocks(log_amp, pha)
-
-        x_orig = amp_pha_istft(mag_wb_g, pha_wb_g, 1024, 256, 1024)
-        x_orig = x_orig.unsqueeze(1)
+        wav_bwe = amp_pha_istft(
+            mag_wb_g,
+            pha_wb_g,
+            n_fft=self.n_fft,
+            hop_size=self.hop_size,
+            win_size=self.win_size,
+            center=True,
+        )
+        wav_bwe = wav_bwe.unsqueeze(1)
+        x = wav_bwe
 
         if self.use_waveunet and self.waveunet_before_spectralmasknet:
-            x = self.apply_waveunet_a2a(x, x_orig)
+            if self.waveunet_input == "waveform":
+                x = self.apply_waveunet_a2a(x, wav_bwe)
+            else:
+                x_feat = x.repeat(1, 8, 1)  # [B,8,T']
+                x = self.apply_waveunet_a2a(x_feat, wav_bwe)
+
         if self.use_spectralmasknet:
             x = self.apply_spectralmasknet(x)
+
         if self.use_waveunet and not self.waveunet_before_spectralmasknet:
-            x = self.apply_waveunet_a2a(x, x_orig)
+            if self.waveunet_input == "waveform":
+                x = self.apply_waveunet_a2a(x, wav_bwe)
+            else:
+                x_feat = x.repeat(1, 8, 1) if x.shape[1] == 1 else x
+                x = self.apply_waveunet_a2a(x_feat, wav_bwe)
 
         x = self.conv_post(x)
         x = torch.tanh(x)
-
         return x
 
 import torch.nn as nn

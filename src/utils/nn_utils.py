@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import weight_norm, spectral_norm
 from librosa.filters import mel as librosa_mel_fn
-from src.utils.frepainter_attention import PreNorm, Attention, FeedForward
+# from src.utils.frepainter_attention import PreNorm, Attention, FeedForward
 
 
 
@@ -706,43 +706,51 @@ class ConvNeXtBlock(nn.Module):
 
 class APNet_BWE_Model(torch.nn.Module):
     def __init__(self, ConvNeXt_layers, ConvNeXt_channels, n_fft):
-        super(APNet_BWE_Model, self).__init__()
+        super().__init__()
         self.adanorm_num_embeddings = None
-        layer_scale_init_value =  1 / ConvNeXt_layers
+        layer_scale_init_value = 1 / ConvNeXt_layers
 
-        self.conv_pre_mag = nn.Conv1d(n_fft//2, ConvNeXt_channels, 7, 1, padding=get_padding(7, 1))
+        self.n_fft = n_fft
+        self.n_bins = n_fft // 2 + 1  # <-- ВАЖНО: 1024 -> 513
+
+        # вход в Conv1d: [B, n_bins, T]
+        self.conv_pre_mag = nn.Conv1d(
+            self.n_bins, ConvNeXt_channels, kernel_size=7, stride=1, padding=get_padding(7, 1)
+        )
         self.norm_pre_mag = nn.LayerNorm(ConvNeXt_channels, eps=1e-6)
-        self.conv_pre_pha = nn.Conv1d(n_fft//2, ConvNeXt_channels, 7, 1, padding=get_padding(7, 1))
+
+        self.conv_pre_pha = nn.Conv1d(
+            self.n_bins, ConvNeXt_channels, kernel_size=7, stride=1, padding=get_padding(7, 1)
+        )
         self.norm_pre_pha = nn.LayerNorm(ConvNeXt_channels, eps=1e-6)
 
-        self.convnext_mag = nn.ModuleList(
-            [
-                ConvNeXtBlock(
-                    dim=ConvNeXt_channels,
-                    layer_scale_init_value=layer_scale_init_value,
-                    adanorm_num_embeddings=self.adanorm_num_embeddings,
-                )
-                for _ in range(ConvNeXt_layers)
-            ]
-        )
+        self.convnext_mag = nn.ModuleList([
+            ConvNeXtBlock(
+                dim=ConvNeXt_channels,
+                layer_scale_init_value=layer_scale_init_value,
+                adanorm_num_embeddings=self.adanorm_num_embeddings,
+            )
+            for _ in range(ConvNeXt_layers)
+        ])
 
-        self.convnext_pha = nn.ModuleList(
-            [
-                ConvNeXtBlock(
-                    dim=ConvNeXt_channels,
-                    layer_scale_init_value=layer_scale_init_value,
-                    adanorm_num_embeddings=self.adanorm_num_embeddings,
-                )
-                for _ in range(ConvNeXt_layers)
-            ]
-        )
+        self.convnext_pha = nn.ModuleList([
+            ConvNeXtBlock(
+                dim=ConvNeXt_channels,
+                layer_scale_init_value=layer_scale_init_value,
+                adanorm_num_embeddings=self.adanorm_num_embeddings,
+            )
+            for _ in range(ConvNeXt_layers)
+        ])
 
         self.norm_post_mag = nn.LayerNorm(ConvNeXt_channels, eps=1e-6)
         self.norm_post_pha = nn.LayerNorm(ConvNeXt_channels, eps=1e-6)
+
         self.apply(self._init_weights)
-        self.linear_post_mag = nn.Linear(ConvNeXt_channels, n_fft//2)
-        self.linear_post_pha_r = nn.Linear(ConvNeXt_channels, n_fft//2)
-        self.linear_post_pha_i = nn.Linear(ConvNeXt_channels, n_fft//2)
+
+        # выход: [B, T, C] -> [B, T, n_bins]
+        self.linear_post_mag = nn.Linear(ConvNeXt_channels, self.n_bins)
+        self.linear_post_pha_r = nn.Linear(ConvNeXt_channels, self.n_bins)
+        self.linear_post_pha_i = nn.Linear(ConvNeXt_channels, self.n_bins)
 
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv1d, nn.Linear)):

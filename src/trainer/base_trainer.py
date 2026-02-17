@@ -373,15 +373,17 @@ class BaseTrainer:
                 )
         return batch
 
-    def _clip_grad_norm(self):
+    def _clip_grad_norm(self, module=None):
         """
         Clips the gradient norm by the value defined in
         config.trainer.max_grad_norm
         """
-        if self.config["trainer"].get("max_grad_norm", None) is not None:
-            clip_grad_norm_(
-                self.model.parameters(), self.config["trainer"]["max_grad_norm"]
-            )
+        max_norm = self.config["trainer"].get("max_grad_norm", None)
+        if max_norm is None:
+            return
+
+        params = module.parameters() if module is not None else self.model.parameters()
+        clip_grad_norm_(params, max_norm)
 
     @torch.no_grad()
     def _get_grad_norm(self, norm_type=2):
@@ -467,11 +469,22 @@ class BaseTrainer:
             "arch": arch,
             "epoch": epoch,
             "state_dict": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "lr_scheduler": self.lr_scheduler.state_dict(),
+
+            # Backward compatibility (single optimizer/scheduler)
+            "optimizer": getattr(self, "optimizer", None).state_dict() if getattr(self, "optimizer", None) is not None else None,
+            "lr_scheduler": getattr(self, "lr_scheduler", None).state_dict() if getattr(self, "lr_scheduler", None) is not None else None,
+
+            # New: GAN-style
+            "gen_optimizer": getattr(self, "gen_optimizer", None).state_dict() if getattr(self, "gen_optimizer", None) is not None else None,
+            "disc_optimizer": getattr(self, "disc_optimizer", None).state_dict() if getattr(self, "disc_optimizer", None) is not None else None,
+            "gen_lr_scheduler": getattr(self, "gen_lr_scheduler", None).state_dict() if getattr(self, "gen_lr_scheduler", None) is not None else None,
+            "disc_lr_scheduler": getattr(self, "disc_lr_scheduler", None).state_dict() if getattr(self, "disc_lr_scheduler", None) is not None else None,
+
             "monitor_best": self.mnt_best,
             "config": self.config,
         }
+
+
         filename = str(self.checkpoint_dir / f"checkpoint-epoch{epoch}.pth")
         if not (only_best and save_best):
             torch.save(state, filename)
@@ -512,22 +525,24 @@ class BaseTrainer:
         self.model.load_state_dict(checkpoint["state_dict"])
 
         # load optimizer state from checkpoint only when optimizer type is not changed.
-        if (
-            checkpoint["config"]["optimizer"] != self.config["optimizer"]
-            or checkpoint["config"]["lr_scheduler"] != self.config["lr_scheduler"]
-        ):
-            self.logger.warning(
-                "Warning: Optimizer or lr_scheduler given in the config file is different "
-                "from that of the checkpoint. Optimizer and scheduler parameters "
-                "are not resumed."
-            )
-        else:
+        # Resume optimizers/schedulers if present in checkpoint
+        # 1) GAN-style
+        if checkpoint.get("gen_optimizer") is not None and hasattr(self, "gen_optimizer"):
+            self.gen_optimizer.load_state_dict(checkpoint["gen_optimizer"])
+        if checkpoint.get("disc_optimizer") is not None and hasattr(self, "disc_optimizer"):
+            self.disc_optimizer.load_state_dict(checkpoint["disc_optimizer"])
+
+        if checkpoint.get("gen_lr_scheduler") is not None and hasattr(self, "gen_lr_scheduler"):
+            self.gen_lr_scheduler.load_state_dict(checkpoint["gen_lr_scheduler"])
+        if checkpoint.get("disc_lr_scheduler") is not None and hasattr(self, "disc_lr_scheduler"):
+            self.disc_lr_scheduler.load_state_dict(checkpoint["disc_lr_scheduler"])
+
+        # 2) Backward compatibility (single optimizer/scheduler)
+        if checkpoint.get("optimizer") is not None and hasattr(self, "optimizer"):
             self.optimizer.load_state_dict(checkpoint["optimizer"])
+        if checkpoint.get("lr_scheduler") is not None and hasattr(self, "lr_scheduler"):
             self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
 
-        self.logger.info(
-            f"Checkpoint loaded. Resume training from epoch {self.start_epoch}"
-        )
 
     def _from_pretrained(self, pretrained_path):
         """

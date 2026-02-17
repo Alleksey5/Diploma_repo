@@ -2,65 +2,63 @@ import torch
 import torch.nn.functional as F
 
 
+def _to_1d(wav: torch.Tensor) -> torch.Tensor:
+    """
+    wav: [1, T] or [T]
+    return: [T]
+    """
+    if wav.dim() == 2:
+        return wav.squeeze(0)
+    return wav
+
+
 def collate_fn(dataset_items: list[dict]):
     """
-    Collate and pad fields in the dataset items.
-    Converts individual items into a batch.
-
-    Args:
-        dataset_items (list[dict]): list of objects from
-            dataset.__getitem__.
-    Returns:
-        result_batch (dict[Tensor]): dict, containing batch-version
-            of the tensors.
+    Expected keys per item:
+      wav:      Tensor [1, T] or [T]
+      gt_wav:   Tensor [1, T] or [T]
+      melspec:  Tensor [n_mels, frames]
+      gt_melspec: Tensor [n_mels, frames]
+      path: str
     """
 
-    result_batch = {}
-    all_wavs = []
-    all_melspecs = []
-    max_len_wav = 0
-    max_len_spec = 0
-    paths = []
-    initial_lens = []
-    initial_melspec_lens = []
-    gt_wavs = []
-    gt_melspecs = []
-    max_len_gt_wav = 0
-    max_len_gt_spec = 0
-    initial_gt_lens = []
-    initial_gt_melspec_lens = []
+    paths = [it["path"] for it in dataset_items]
 
+    wavs = [_to_1d(it["wav"]) for it in dataset_items]
+    gt_wavs = [_to_1d(it["gt_wav"]) for it in dataset_items]
 
-    for item in dataset_items:
-        paths.append(item['path'])
-        all_wavs.append(item['wav'].squeeze(0))
-        all_melspecs.append(item['melspec'])
-        max_len_wav = max(len(item['wav'].squeeze(0)), max_len_wav)
-        max_len_spec =  max(item['melspec'].shape[-1], max_len_spec)
-        initial_lens.append(item['wav'].shape[1])
-        initial_melspec_lens.append(item['melspec'].shape[-1])
-        gt_wavs.append(item['gt_wav'].squeeze(0))
-        gt_melspecs.append(item['gt_melspec'])
-        max_len_gt_wav = max(len(item['gt_wav'].squeeze(0)), max_len_gt_wav)
-        max_len_gt_spec =  max(item['gt_melspec'].shape[-1], max_len_gt_spec)
-        initial_gt_lens.append(item['gt_wav'].shape[1])
-        initial_gt_melspec_lens.append(item['gt_melspec'].shape[-1])
+    mels = [it["melspec"] for it in dataset_items]
+    gt_mels = [it["gt_melspec"] for it in dataset_items]
 
-    result_batch['initial_len'] = initial_lens
-    result_batch['initial_gt_len'] = initial_gt_lens
-    
-    padded_wavs = torch.stack([F.pad(wav, (0, max_len_wav - wav.shape[0]), value=0) for wav in all_wavs])
-    result_batch['initial_melspec_len'] = initial_melspec_lens
-    padded_specs = torch.stack([F.pad(spec, (0, max_len_spec - spec.shape[-1], 0, 0)) for spec in all_melspecs])
-    result_batch['wav'] = padded_wavs.unsqueeze(1)
-    result_batch['melspec'] = padded_specs
+    # lengths (Tensor[int])
+    initial_len = torch.tensor([w.shape[-1] for w in wavs], dtype=torch.long)
+    initial_gt_len = torch.tensor([w.shape[-1] for w in gt_wavs], dtype=torch.long)
 
+    initial_melspec_len = torch.tensor([m.shape[-1] for m in mels], dtype=torch.long)
+    initial_gt_melspec_len = torch.tensor([m.shape[-1] for m in gt_mels], dtype=torch.long)
 
-    padded_gt_wavs = torch.stack([F.pad(wav, (0, max_len_gt_wav - wav.shape[0]), value=0) for wav in gt_wavs])
-    result_batch['initial_gt_melspec_len'] = initial_gt_melspec_lens
-    padded_gt_specs = torch.stack([F.pad(spec, (0, max_len_gt_spec - spec.shape[-1], 0, 0)) for spec in gt_melspecs])
-    result_batch['gt_wav'] = padded_gt_wavs.unsqueeze(1)
-    result_batch['gt_melspec'] = padded_gt_specs
+    # pad wavs to max T
+    max_len_wav = int(initial_len.max().item())
+    max_len_gt_wav = int(initial_gt_len.max().item())
 
-    result_batch['path'] = paths
-    return result_batch
+    padded_wavs = torch.stack([F.pad(w, (0, max_len_wav - w.shape[-1])) for w in wavs])  # [B, T]
+    padded_gt_wavs = torch.stack([F.pad(w, (0, max_len_gt_wav - w.shape[-1])) for w in gt_wavs])  # [B, T]
+
+    # pad mels to max frames
+    max_len_spec = int(initial_melspec_len.max().item())
+    max_len_gt_spec = int(initial_gt_melspec_len.max().item())
+
+    padded_mels = torch.stack([F.pad(m, (0, max_len_spec - m.shape[-1], 0, 0)) for m in mels])  # [B, n_mels, F]
+    padded_gt_mels = torch.stack([F.pad(m, (0, max_len_gt_spec - m.shape[-1], 0, 0)) for m in gt_mels])  # [B, n_mels, F]
+
+    return {
+        "wav": padded_wavs.unsqueeze(1),              # [B, 1, T]
+        "gt_wav": padded_gt_wavs.unsqueeze(1),        # [B, 1, T]
+        "melspec": padded_mels,                       # [B, n_mels, F]
+        "gt_melspec": padded_gt_mels,                 # [B, n_mels, F]
+        "initial_len": initial_len,
+        "initial_gt_len": initial_gt_len,
+        "initial_melspec_len": initial_melspec_len,
+        "initial_gt_melspec_len": initial_gt_melspec_len,
+        "path": paths,
+    }

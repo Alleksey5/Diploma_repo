@@ -40,7 +40,7 @@ class Wav2Vec2MOS(nn.Module):
             for p in self.encoder.parameters():
                 p.requires_grad_(False)
 
-        state = torch.load(path, map_location=self.device)
+        state = state = torch.load(path, map_location=self.device, weights_only=False)
         self.load_state_dict(extract_prefix("model.", state["state_dict"]))
 
         self.eval()

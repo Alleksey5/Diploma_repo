@@ -13,6 +13,70 @@ from src.model.hifigan import mel_spectrogram
 
 
 class Trainer(BaseTrainer):
+    def __init__(
+        self,
+        model,
+        criterion,
+        metrics,
+        gen_optimizer,
+        disc_optimizer,
+        gen_lr_scheduler,
+        disc_lr_scheduler,
+        config,
+        device,
+        dataloaders,
+        logger,
+        writer,
+        epoch_len=None,
+        skip_oom=True,
+        batch_transforms=None,
+    ):
+        super().__init__(
+            model=model,
+            criterion=criterion,
+            metrics=metrics,
+            optimizer=gen_optimizer,
+            lr_scheduler=gen_lr_scheduler,
+            config=config,
+            device=device,
+            dataloaders=dataloaders,
+            logger=logger,
+            writer=writer,
+            epoch_len=epoch_len,
+            skip_oom=skip_oom,
+            batch_transforms=batch_transforms,
+        )
+
+        self.gen_optimizer = gen_optimizer
+        self.disc_optimizer = disc_optimizer
+        self.gen_lr_scheduler = gen_lr_scheduler
+        self.disc_lr_scheduler = disc_lr_scheduler
+
+    def create_mel_spec(self, wav: torch.Tensor) -> torch.Tensor:
+        """
+        wav: [B, 1, T] или [B, T]
+        return: [B, 80, frames]
+        """
+        if wav.dim() == 3:
+            wav = wav.squeeze(1)  # [B, T]
+
+        mel = mel_spectrogram(
+            wav,
+            n_fft=1024,
+            num_mels=80,
+            sampling_rate=16000,
+            hop_size=256,
+            win_size=1024,
+            fmin=0,
+            fmax=8000,
+            center=False,
+        )
+        
+        if mel.dim() == 2:
+            mel = mel.unsqueeze(0)  # [1, 80, T]
+
+        return mel
+
     """
     Trainer class. Defines the logic of batch logging and processing.
     """
@@ -38,15 +102,21 @@ class Trainer(BaseTrainer):
         batch = self.move_batch_to_device(batch)
         batch = self.transform_batch(batch)  # transform batch on device -- faster
 
-        initial_wav = batch['wav']
-        # initial_melspec = batch['melspec']
+        initial_wav = batch["wav"]     # NB
+        gt_wav = batch["gt_wav"]       # WB
         wav_fake = self.model.generator(initial_wav)
-        gt_wav = batch['gt_wav']
  
-        if gt_wav.shape != wav_fake.shape:
-            wav_fake = torch.stack([F.pad(wav, (0, gt_wav.shape[2] - wav_fake.shape[2]), value=0) for wav in wav_fake])
+        # wav_fake: [B, 1, T_fake], gt_wav: [B, 1, T_gt]
+        T_fake = wav_fake.shape[-1]
+        T_gt = gt_wav.shape[-1]
+
+        if T_fake < T_gt:
+            wav_fake = F.pad(wav_fake, (0, T_gt - T_fake))
+        elif T_fake > T_gt:
+            wav_fake = wav_fake[..., :T_gt]
+
         batch["generated_wav"] = wav_fake
-        mel_spec_fake = self.create_mel_spec(wav_fake).squeeze(1)
+        mel_spec_fake = self.create_mel_spec(wav_fake)
         batch['mel_spec_fake'] = mel_spec_fake
         if self.is_train:
             self.disc_optimizer.zero_grad()
@@ -105,6 +175,7 @@ class Trainer(BaseTrainer):
         batch["mpd_feats_gen_loss"] = mpd_feats_gen_loss
         batch["msd_feats_gen_loss"] = msd_feats_gen_loss
         batch["gen_loss"] = gen_loss
+        batch["loss"] = gen_loss + disc_loss
     
 
 
@@ -113,12 +184,20 @@ class Trainer(BaseTrainer):
             metrics.update(loss_name, batch[loss_name].item())
 
         if not self.is_train:
-            # for i in range(len(self.metrics["inference"])):
-            calculate_all_metrics(batch['generated_wav'], batch['gt_wav'], self.metrics["inference"], self.config.datasets.val.low_sampling_rate, self.config.datasets.val.high_sampling_rate)
-            # for metric in self.metrics["inference"]:
+            scores = calculate_all_metrics(
+                batch["generated_wav"],
+                batch["gt_wav"],
+                self.metrics["inference"],
+                self.config.datasets.val.low_sampling_rate,
+                self.config.datasets.val.high_sampling_rate,
+            )
 
-            # self.metrics["inference"][i](batch['generated_wav'], batch['initial_len'])
+            # scores: {"PESQ": (mean,std), ...}
+            for name, (mean, std) in scores.items():
+                batch[name] = torch.tensor(float(mean), device=self.device)
+
         return batch
+
 
     def _log_batch(self, batch_idx, batch, mode="train"):
         """

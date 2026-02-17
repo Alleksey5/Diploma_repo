@@ -1,0 +1,10 @@
+train: []
+inference:
+  - _target_: src.metrics.MOSNet
+    name: "MOS"
+  - _target_: src.metrics.LSD
+    name: "LSD"
+  - _target_: src.metrics.STOI
+    name: "STOI"
+  - _target_: src.metrics.PESQ
+    name: "PESQ"

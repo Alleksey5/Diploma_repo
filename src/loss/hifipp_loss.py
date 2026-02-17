@@ -50,9 +50,15 @@ class MelSpectrogramLoss(nn.Module):
 
     
 class HiFiGANLoss(nn.Module):
+
     def __init__(self):
         super().__init__()
         self.discriminator_loss = DiscriminatorLoss()
         self.generator_loss = GeneratorLoss()
         self.melspec_loss = MelSpectrogramLoss()
         self.fm_loss = FeatureMatchingLoss()
+
+    def forward(self, **kwargs):
+        raise NotImplementedError(
+            "Эм"
+        )
