@@ -28,13 +28,14 @@ trainer:
   log_step: 1
   n_epochs: 1
   epoch_len: 2
-  device_tensors: ["wav", "melspec", "gt_wav", "gt_melspec"] # which tensors should be on device (ex. GPU)
-  resume_from: null # null or path to the checkpoint dir with *.pth and config.yaml
-  device: auto # device name or "auto"
-  override: True # if True, will override the previous run with the same name
-  monitor: "max val_SISDR" # "off" or "max/min metric_name", i.e. our goal is to maximize/minimize metric
-  save_period: 5 # checkpoint each save_period epochs in addition to the best epoch
-  early_stop: ${trainer.n_epochs} # epochs for early stopping
+  device_tensors: ["wav", "gt_wav", "gt_melspec"]
+  resume_from: null
+  device: auto
+  override: True
+  monitor: "off"
+  save_period: 5
+  early_stop: ${trainer.n_epochs}
   save_dir: "saved_dir"
   seed: 1
   max_grad_norm: 10
+
