@@ -5,3 +5,4 @@ from src.metrics.stoi import STOI
 from src.metrics.mosnet import MOSNet
 from src.metrics.rtf import RTF
 from src.metrics.thop import THOPMetric
+from src.metrics.lsd import LSD

@@ -1,10 +1,29 @@
 train: []
+
 inference:
-  - _target_: src.metrics.MOSNet
-    name: "MOS"
-  - _target_: src.metrics.LSD
+
+  - _target_: src.metrics.mosnet.MOSNet
+    name: "MOSNet"
+    sr: 16000
+    num_splits: 8
+
+  - _target_: src.metrics.lsd.LSD
     name: "LSD"
-  - _target_: src.metrics.STOI
+    nfft: 2048
+    hop: 512
+
+  - _target_: src.metrics.stoi.STOI
     name: "STOI"
-  - _target_: src.metrics.PESQ
+    use_pit: false
+
+  - _target_: src.metrics.pesq.PESQ
     name: "PESQ"
+    use_pit: false
+
+  - _target_: src.metrics.sdri.SI_SDR
+    name: "SI_SDR"
+    use_pit: false
+
+  - _target_: src.metrics.snr.SNR
+    name: "SNR"
+    use_pit: false

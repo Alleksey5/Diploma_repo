@@ -399,27 +399,43 @@ class COVL(CSEMetric):
         self.func = lambda x, y: composite_eval(x, y)["covl"]
 
 
-def calculate_all_metrics(wavs, reference_wavs, metrics, initial_sr, target_sr,  n_max_files=None):
-    scores = {metric.name: [] for metric in metrics}
-    for x, y in tqdm(
-        itertools.islice(zip(wavs, reference_wavs), n_max_files),
-        total=n_max_files if n_max_files is not None else len(wavs),
-        desc="Calculating metrics",
-    ):
+def calculate_all_metrics(wavs, reference_wavs, metrics, initial_sr, target_sr, n_max_files=None):
+    """
+    Works with BaseMetric metrics:
+      metric(source=..., predict=...) -> scalar (float / tensor)
+    Returns:
+      dict: {metric.name: (mean, std)}
+    """
+    scores = {m.name: [] for m in metrics}
+
+    it = itertools.islice(zip(wavs, reference_wavs), n_max_files)
+    total = n_max_files if n_max_files is not None else len(wavs)
+
+    for x, y in tqdm(it, total=total, desc="Calculating metrics"):
         x = x.detach().cpu().numpy()
         y = y.detach().cpu().numpy()
-        x = x[0, :]
-        y = y[0, :]
-        x = librosa.util.normalize(x[: min(len(x), len(y))])
-        y = librosa.util.normalize(y[: min(len(x), len(y))])
-        x = torch.from_numpy(x)[None, None]
+
+        x = x[0, :] if x.ndim == 2 else x[0, 0, :]
+        y = y[0, :] if y.ndim == 2 else y[0, 0, :]
+
+        L = min(len(x), len(y))
+        x = librosa.util.normalize(x[:L])
+        y = librosa.util.normalize(y[:L])
+
+        x = torch.from_numpy(x)[None, None]  # [1,1,T]
         y = torch.from_numpy(y)[None, None]
-        for metric in metrics:
-            if metric.name=='LSD_LF' or metric.name=='LSD_HF':
-                metric.__call__(x, y, initial_sr, target_sr)
+
+        for m in metrics:
+            if getattr(m, "name", "") in ("LSD_LF", "LSD_HF"):
+                val = m(source=y, predict=x, initial_sr=initial_sr, target_sr=target_sr)
             else:
-                metric.__call__(x, y)
-            scores[metric.name] += [np.mean(metric.result["mean"])]
-    scores = {k: (np.mean(v), np.std(v)) for k, v in scores.items()}
-    return scores
+                val = m(source=y, predict=x)
+
+            if isinstance(val, torch.Tensor):
+                val = val.detach().cpu().item()
+
+            scores[m.name].append(float(val))
+
+    return {k: (float(np.mean(v)), float(np.std(v))) for k, v in scores.items()}
+
 

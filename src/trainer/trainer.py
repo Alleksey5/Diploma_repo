@@ -183,6 +183,8 @@ class Trainer(BaseTrainer):
         for loss_name in self.config.writer.loss_names:
             metrics.update(loss_name, batch[loss_name].item())
 
+        scores = {}
+
         if not self.is_train:
             scores = calculate_all_metrics(
                 batch["generated_wav"],
@@ -192,9 +194,9 @@ class Trainer(BaseTrainer):
                 self.config.datasets.val.high_sampling_rate,
             )
 
-            # scores: {"PESQ": (mean,std), ...}
-            for name, (mean, std) in scores.items():
-                batch[name] = torch.tensor(float(mean), device=self.device)
+        for name, (mean, std) in scores.items():
+            batch[name] = torch.tensor(mean, device=self.device)
+
 
         return batch
 
