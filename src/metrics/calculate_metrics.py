@@ -401,11 +401,16 @@ class COVL(CSEMetric):
 
 def calculate_all_metrics(wavs, reference_wavs, metrics, initial_sr, target_sr, n_max_files=None):
     """
-    Works with BaseMetric metrics:
-      metric(source=..., predict=...) -> scalar (float / tensor)
-    Returns:
-      dict: {metric.name: (mean, std)}
+    Поддерживает 2 типа метрик:
+    1) "BaseMetric": m(source=..., predict=...) -> float
+    2) "Metric" (как у тебя LSD/STOI/PESQ/CSIG/...): m(samples, real_samples, ...) и пишет в m.result
+    Возвращает: dict {metric.name: (mean, std)}
     """
+    for m in metrics:
+        if hasattr(m, "result") and isinstance(m.result, dict):
+            for k in list(m.result.keys()):
+                m.result[k] = []
+
     scores = {m.name: [] for m in metrics}
 
     it = itertools.islice(zip(wavs, reference_wavs), n_max_files)
@@ -422,20 +427,28 @@ def calculate_all_metrics(wavs, reference_wavs, metrics, initial_sr, target_sr, 
         x = librosa.util.normalize(x[:L])
         y = librosa.util.normalize(y[:L])
 
-        x = torch.from_numpy(x)[None, None]  # [1,1,T]
-        y = torch.from_numpy(y)[None, None]
-
+        x_t = torch.from_numpy(x).float().unsqueeze(0)
+        y_t = torch.from_numpy(y).float().unsqueeze(0)
         for m in metrics:
-            if getattr(m, "name", "") in ("LSD_LF", "LSD_HF"):
-                val = m(source=y, predict=x, initial_sr=initial_sr, target_sr=target_sr)
+            if hasattr(m, "result"):
+                if getattr(m, "name", "") in ("LSD_LF", "LSD_HF"):
+                    m(x_t, y_t, initial_sr=initial_sr, target_sr=target_sr)
+                else:
+                    m(x_t, y_t)
+
+                mean_list = m.result.get("mean", [])
+                if isinstance(mean_list, list) and len(mean_list) > 0:
+                    val = float(mean_list[-1])
+                else:
+                    val = 0.0
+
             else:
-                val = m(source=y, predict=x)
+                val = m(source=y_t.unsqueeze(1), predict=x_t.unsqueeze(1))
+                if isinstance(val, torch.Tensor):
+                    val = val.detach().cpu().item()
+                val = float(val)
 
-            if isinstance(val, torch.Tensor):
-                val = val.detach().cpu().item()
-
-            scores[m.name].append(float(val))
+            scores[m.name].append(val)
 
     return {k: (float(np.mean(v)), float(np.std(v))) for k, v in scores.items()}
-
 

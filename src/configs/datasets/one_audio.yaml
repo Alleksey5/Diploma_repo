@@ -1,0 +1,25 @@
+train:
+  _target_: src.datasets.VCTKDataset
+  dataset_split_file: data/one_train.txt
+  vctk_wavs_dir: /content/Diploma_repo/data
+
+  segment_size: 32768
+  high_sampling_rate: 16000
+  low_sampling_rate: 4000
+  lowpass: "default"
+  split: True
+  shuffle: False
+  device: ${trainer.device}
+
+val:
+  _target_: src.datasets.VCTKDataset
+  dataset_split_file: data/one_train.txt
+  vctk_wavs_dir: /content/Diploma_repo/data
+
+  segment_size: 32768
+  high_sampling_rate: 16000
+  low_sampling_rate: 4000
+  lowpass: "default"
+  split: True
+  shuffle: False
+  device: ${trainer.device}

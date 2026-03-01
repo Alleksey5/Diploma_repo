@@ -193,6 +193,8 @@ class Trainer(BaseTrainer):
                 self.config.datasets.val.low_sampling_rate,
                 self.config.datasets.val.high_sampling_rate,
             )
+            for name, (mean, std) in scores.items():
+                metrics.update(name, float(mean))
 
         for name, (mean, std) in scores.items():
             batch[name] = torch.tensor(mean, device=self.device)

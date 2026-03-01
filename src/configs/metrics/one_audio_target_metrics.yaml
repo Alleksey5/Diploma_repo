@@ -1,0 +1,21 @@
+train: []
+inference:
+  - _target_: src.metrics.calculate_metrics.LSD
+    name: "LSD"
+
+  - _target_: src.metrics.calculate_metrics.COVL
+    name: "COVL"
+
+  - _target_: src.metrics.calculate_metrics.CSIG
+    name: "CSIG"
+
+  - _target_: src.metrics.calculate_metrics.CBAK
+    name: "CBAK"
+
+  - _target_: src.metrics.calculate_metrics.STOI
+    name: "STOI"
+    sr: 16000
+
+  - _target_: src.metrics.calculate_metrics.PESQ
+    name: "PESQ"
+    sr: 16000
