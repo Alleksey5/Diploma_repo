@@ -1,1 +1,8 @@
 VCTK/wavs/p361_001.wav
+VCTK/wavs/p361_002.wav
+VCTK/wavs/p361_003.wav
+VCTK/wavs/p361_004.wav
+VCTK/wavs/p361_005.wav
+VCTK/wavs/p361_006.wav
+VCTK/wavs/p361_007.wav
+VCTK/wavs/p361_008.wav
