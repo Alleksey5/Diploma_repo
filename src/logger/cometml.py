@@ -1,4 +1,6 @@
 from datetime import datetime
+from pathlib import Path
+import json
 
 import numpy as np
 import pandas as pd
@@ -6,9 +8,8 @@ import pandas as pd
 
 class CometMLWriter:
     """
-    Class for experiment tracking via CometML.
-
-    See https://www.comet.com/docs/v2/.
+    Class for experiment tracking via CometML
+    + local scalar logging to jsonl/csv.
     """
 
     def __init__(
@@ -20,33 +21,39 @@ class CometMLWriter:
         run_id=None,
         run_name=None,
         mode="online",
+        log_to_local=True,
+        local_log_filename="metrics.jsonl",
+        local_summary_filename="metrics_latest.csv",
         **kwargs,
     ):
-        """
-        API key is expected to be provided by the user in the terminal.
+        self.logger = logger
+        self.project_config = project_config
+        self.run_id = run_id
+        self.step = 0
+        self.mode = ""
+        self.timer = datetime.now()
 
-        Args:
-            logger (Logger): logger that logs output.
-            project_config (dict): config for the current experiment.
-            project_name (str): name of the project inside experiment tracker.
-            workspace (str | None): name of the workspace inside experiment
-                tracker. Used if you work in a team.
-            run_id (str | None): the id of the current run.
-            run_name (str | None): the name of the run. If None, random name
-                is given.
-            mode (str): if online, log data to the remote server. If
-                offline, log locally.
-        """
+        # ---------- local logging ----------
+        self.log_to_local = log_to_local
+        self._local_rows = []
+
+        save_dir = Path(project_config["trainer"]["save_dir"]) / project_config["writer"]["run_name"]
+        self.local_run_dir = Path(save_dir)
+        self.local_run_dir.mkdir(parents=True, exist_ok=True)
+
+        self.local_log_path = self.local_run_dir / local_log_filename
+        self.local_summary_path = self.local_run_dir / local_summary_filename
+
+        # ---------- comet ----------
+        self.exp = None
+        self.comet_available = False
+
         try:
             import comet_ml
 
             comet_ml.login()
 
-            self.run_id = run_id
-
-            resume = False
-            if project_config["trainer"].get("resume_from") is not None:
-                resume = True
+            resume = project_config["trainer"].get("resume_from") is not None
 
             if resume:
                 if mode == "offline":
@@ -73,180 +80,132 @@ class CometMLWriter:
                 self.exp.set_name(run_name)
                 self.exp.log_parameters(parameters=project_config)
 
-            self.comel_ml = comet_ml
+            self.comet_available = True
+            self.comet_ml = comet_ml
 
-        except ImportError:
-            logger.warning("For use comet_ml install it via \n\t pip install comet_ml")
-
-        self.step = 0
-        # the mode is usually equal to the current partition name
-        # used to separate Partition1 and Partition2 metrics
-        self.mode = ""
-        self.timer = datetime.now()
 
     def set_step(self, step, mode="train"):
-        """
-        Define current step and mode for the tracker.
-
-        Calculates the difference between method calls to monitor
-        training/evaluation speed.
-
-        Args:
-            step (int): current step.
-            mode (str): current mode (partition name).
-        """
         self.mode = mode
         previous_step = self.step
         self.step = step
+
         if step == 0:
             self.timer = datetime.now()
         else:
             duration = datetime.now() - self.timer
-            self.add_scalar(
-                "steps_per_sec", (self.step - previous_step) / duration.total_seconds()
-            )
+            seconds = max(duration.total_seconds(), 1e-12)
+            self.add_scalar("steps_per_sec", (self.step - previous_step) / seconds)
             self.timer = datetime.now()
 
     def _object_name(self, object_name):
-        """
-        Update object_name (scalar, image, etc.) with the
-        current mode (partition name). Used to separate metrics
-        from different partitions.
-
-        Args:
-            object_name (str): current object name.
-        Returns:
-            object_name (str): updated object name.
-        """
         return f"{object_name}_{self.mode}"
 
+    def _write_local_scalar(self, scalar_name, scalar):
+        if not self.log_to_local:
+            return
+
+        row = {
+            "timestamp": datetime.now().isoformat(),
+            "step": int(self.step),
+            "mode": self.mode,
+            "name": self._object_name(scalar_name),
+            "value": float(scalar),
+        }
+
+        with open(self.local_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        self._local_rows.append(row)
+
+        try:
+            latest = {}
+            for r in self._local_rows:
+                latest[r["name"]] = {
+                    "timestamp": r["timestamp"],
+                    "step": r["step"],
+                    "mode": r["mode"],
+                    "name": r["name"],
+                    "value": r["value"],
+                }
+            pd.DataFrame(latest.values()).to_csv(self.local_summary_path, index=False)
+        except Exception as e:
+            self.logger.warning(f"Не удалось сохранить локальный CSV с метриками: {e}")
+
     def add_checkpoint(self, checkpoint_path, save_dir):
-        """
-        Log checkpoints to the experiment tracker.
-
-        The checkpoints will be available in the Assets & Artifacts section
-        inside the models/checkpoints directory.
-
-        Args:
-            checkpoint_path (str): path to the checkpoint file.
-            save_dir (str): path to the dir, where checkpoint is saved.
-        """
-        # For comet, save dir is not required
-        # It is kept for consistency with WandB
-        self.exp.log_model(
-            name="checkpoints", file_or_folder=checkpoint_path, overwrite=True
-        )
+        if self.comet_available and self.exp is not None:
+            self.exp.log_model(
+                name="checkpoints",
+                file_or_folder=checkpoint_path,
+                overwrite=True,
+            )
 
     def add_scalar(self, scalar_name, scalar):
-        """
-        Log a scalar to the experiment tracker.
+        scalar = float(scalar)
 
-        Args:
-            scalar_name (str): name of the scalar to use in the tracker.
-            scalar (float): value of the scalar.
-        """
-        self.exp.log_metrics(
-            {
-                self._object_name(scalar_name): scalar,
-            },
-            step=self.step,
-        )
+        self._write_local_scalar(scalar_name, scalar)
+
+        if self.comet_available and self.exp is not None:
+            self.exp.log_metrics(
+                {self._object_name(scalar_name): scalar},
+                step=self.step,
+            )
 
     def add_scalars(self, scalars):
-        """
-        Log several scalars to the experiment tracker.
+        for scalar_name, scalar in scalars.items():
+            self._write_local_scalar(scalar_name, float(scalar))
 
-        Args:
-            scalars (dict): dict, containing scalar name and value.
-        """
-        self.exp.log_metrics(
-            {
-                self._object_name(scalar_name): scalar
-                for scalar_name, scalar in scalars.items()
-            },
-            step=self.step,
-        )
+        if self.comet_available and self.exp is not None:
+            self.exp.log_metrics(
+                {
+                    self._object_name(scalar_name): float(scalar)
+                    for scalar_name, scalar in scalars.items()
+                },
+                step=self.step,
+            )
 
     def add_image(self, image_name, image):
-        """
-        Log an image to the experiment tracker.
-
-        Args:
-            image_name (str): name of the image to use in the tracker.
-            image (Path | Tensor | ndarray | list[tuple] | Image): image
-                in the CometML-friendly format.
-        """
-        self.exp.log_image(
-            image_data=image, name=self._object_name(image_name), step=self.step
-        )
+        if self.comet_available and self.exp is not None:
+            self.exp.log_image(
+                image_data=image,
+                name=self._object_name(image_name),
+                step=self.step,
+            )
 
     def add_audio(self, audio_name, audio, sample_rate=None):
-        """
-        Log an audio to the experiment tracker.
-
-        Args:
-            audio_name (str): name of the audio to use in the tracker.
-            audio (Path | ndarray): audio in the CometML-friendly format.
-            sample_rate (int): audio sample rate.
-        """
-        audio = audio.detach().cpu().numpy().T
-        self.exp.log_audio(
-            file_name=self._object_name(audio_name),
-            audio_data=audio,
-            sample_rate=sample_rate,
-            step=self.step,
-        )
+        if self.comet_available and self.exp is not None:
+            audio = audio.detach().cpu().numpy().T
+            self.exp.log_audio(
+                file_name=self._object_name(audio_name),
+                audio_data=audio,
+                sample_rate=sample_rate,
+                step=self.step,
+            )
 
     def add_text(self, text_name, text):
-        """
-        Log text to the experiment tracker.
-
-        Args:
-            text_name (str): name of the text to use in the tracker.
-            text (str): text content.
-        """
-        self.exp.log_text(
-            text=text, step=self.step, metadata={"name": self._object_name(text_name)}
-        )
+        if self.comet_available and self.exp is not None:
+            self.exp.log_text(
+                text=text,
+                step=self.step,
+                metadata={"name": self._object_name(text_name)},
+            )
 
     def add_histogram(self, hist_name, values_for_hist, bins=None):
-        """
-        Log histogram to the experiment tracker.
-
-        Args:
-            hist_name (str): name of the histogram to use in the tracker.
-            values_for_hist (Tensor): array of values to calculate
-                histogram of.
-            bins (int | str): the definition of bins for the histogram.
-        """
-        # For comet, bins argument is not required
-        # It is kept for consistency with WandB
-
-        values_for_hist = values_for_hist.detach().cpu().numpy()
-
-        # np_hist = np.histogram(values_for_hist, bins=bins)
-        # if np_hist[0].shape[0] > 512:
-        #     np_hist = np.histogram(values_for_hist, bins=512)
-
-        self.exp.log_histogram_3d(
-            values=values_for_hist, name=self._object_name(hist_name), step=self.step
-        )
+        if self.comet_available and self.exp is not None:
+            values_for_hist = values_for_hist.detach().cpu().numpy()
+            self.exp.log_histogram_3d(
+                values=values_for_hist,
+                name=self._object_name(hist_name),
+                step=self.step,
+            )
 
     def add_table(self, table_name, table: pd.DataFrame):
-        """
-        Log table to the experiment tracker.
-
-        Args:
-            table_name (str): name of the table to use in the tracker.
-            table (DataFrame): table content.
-        """
-        self.exp.set_step(self.step)
-        # log_table does not support step directly
-        self.exp.log_table(
-            filename=self._object_name(table_name) + ".csv",
-            tabular_data=table,
-            headers=True,
-        )
+        if self.comet_available and self.exp is not None:
+            self.exp.set_step(self.step)
+            self.exp.log_table(
+                filename=self._object_name(table_name) + ".csv",
+                tabular_data=table,
+                headers=True,
+            )
 
     def add_images(self, image_names, images):
         raise NotImplementedError()

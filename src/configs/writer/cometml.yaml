@@ -1,8 +1,12 @@
 _target_: src.logger.CometMLWriter
 project_name: "pytorch_template_asr_example"
 workspace: null
-run_name: "testing"
+run_name: "big_test_run"
 mode: "online"
+
+log_to_local: True
+local_log_filename: "metrics.jsonl"
+local_summary_filename: "metrics_latest.csv"
 
 loss_names:
   - gen_loss

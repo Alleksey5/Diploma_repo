@@ -234,7 +234,7 @@ class LSD_LF(Metric):
     def better(self, first, second):
         return first < second
     
-    def __call__(self, out_sig, ref_sig, initial_sr, target_sr, cutoff_freq=4000):
+    def __call__(self, out_sig, ref_sig, initial_sr, target_sr, cutoff_freq=2000):
         """
         Compute LSD for frequencies below cutoff_freq
         """
@@ -262,7 +262,7 @@ class LSD_HF(Metric):
     def better(self, first, second):
         return first < second
     
-    def __call__(self, out_sig, ref_sig, initial_sr, target_sr, cutoff_freq=4000):
+    def __call__(self, out_sig, ref_sig, initial_sr, target_sr, cutoff_freq=2000):
         """
         Compute LSD for frequencies above cutoff_freq
         """
