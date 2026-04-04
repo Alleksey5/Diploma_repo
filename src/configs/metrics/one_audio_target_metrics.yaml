@@ -1,7 +1,14 @@
 train: []
+
 inference:
   - _target_: src.metrics.calculate_metrics.LSD
     name: "LSD"
+
+  - _target_: src.metrics.calculate_metrics.LSD_LF
+    name: "LSD_LF"
+
+  - _target_: src.metrics.calculate_metrics.LSD_HF
+    name: "LSD_HF"
 
   - _target_: src.metrics.calculate_metrics.COVL
     name: "COVL"
