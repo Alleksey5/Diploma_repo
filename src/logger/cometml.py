@@ -48,40 +48,39 @@ class CometMLWriter:
         self.exp = None
         self.comet_available = False
 
-        try:
-            import comet_ml
+        import comet_ml
 
-            comet_ml.login()
+        comet_ml.login()
 
-            resume = project_config["trainer"].get("resume_from") is not None
+        resume = project_config["trainer"].get("resume_from") is not None
 
-            if resume:
-                if mode == "offline":
-                    exp_class = comet_ml.ExistingOfflineExperiment
-                else:
-                    exp_class = comet_ml.ExistingExperiment
-
-                self.exp = exp_class(experiment_key=self.run_id)
+        if resume:
+            if mode == "offline":
+                exp_class = comet_ml.ExistingOfflineExperiment
             else:
-                if mode == "offline":
-                    exp_class = comet_ml.OfflineExperiment
-                else:
-                    exp_class = comet_ml.Experiment
+                exp_class = comet_ml.ExistingExperiment
 
-                self.exp = exp_class(
-                    project_name=project_name,
-                    workspace=workspace,
-                    experiment_key=self.run_id,
-                    log_code=kwargs.get("log_code", False),
-                    log_graph=kwargs.get("log_graph", False),
-                    auto_metric_logging=kwargs.get("auto_metric_logging", False),
-                    auto_param_logging=kwargs.get("auto_param_logging", False),
-                )
-                self.exp.set_name(run_name)
-                self.exp.log_parameters(parameters=project_config)
+            self.exp = exp_class(experiment_key=self.run_id)
+        else:
+            if mode == "offline":
+                exp_class = comet_ml.OfflineExperiment
+            else:
+                exp_class = comet_ml.Experiment
 
-            self.comet_available = True
-            self.comet_ml = comet_ml
+            self.exp = exp_class(
+                project_name=project_name,
+                workspace=workspace,
+                experiment_key=self.run_id,
+                log_code=kwargs.get("log_code", False),
+                log_graph=kwargs.get("log_graph", False),
+                auto_metric_logging=kwargs.get("auto_metric_logging", False),
+                auto_param_logging=kwargs.get("auto_param_logging", False),
+            )
+            self.exp.set_name(run_name)
+            self.exp.log_parameters(parameters=project_config)
+
+        self.comet_available = True
+        self.comet_ml = comet_ml
 
 
     def set_step(self, step, mode="train"):
