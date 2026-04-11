@@ -9,15 +9,22 @@ defaults:
 
 gen_optimizer:
   _target_: torch.optim.AdamW
-  lr: 2e-4
+  lr: 1e-4
   betas: [0.8, 0.99]
   weight_decay: 0.01
 
 disc_optimizer:
   _target_: torch.optim.AdamW
-  lr: 2e-4
+  lr: 1e-4
   betas: [0.8, 0.99]
   weight_decay: 0.01
+
+loss_function:
+  _target_: src.loss.HiFiGANLoss
+  lambda_mel: 45.0
+  lambda_fm: 2.0
+  lambda_adv: 1.0
+  lambda_stft: 5.0
 
 gen_lr_scheduler:
   _target_: torch.optim.lr_scheduler.ExponentialLR

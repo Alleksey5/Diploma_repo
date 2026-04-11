@@ -106,11 +106,96 @@ def mel_spectrogram(
     else:
         return result
 
-
-
-
 def closest_power_of_two(n):
     return 1 << (n - 1).bit_length()
+
+class DFHead(nn.Module):
+    def __init__(self, in_channels, n_fft=1024, hop_length=256,
+                 df_bins=128, df_order=5, lookahead=1):
+        super().__init__()
+
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.df_bins = df_bins
+        self.df_order = df_order
+        self.lookahead = lookahead
+
+        self.df_proj = nn.Conv1d(in_channels, df_bins * df_order * 2, kernel_size=1)
+        self.alpha_proj = nn.Conv1d(in_channels, 1, kernel_size=1)
+
+        self.register_buffer("window", torch.hann_window(n_fft))
+
+    def stft(self, x):
+        window = self.window.to(device=x.device, dtype=x.dtype)
+        return torch.stft(
+            x.squeeze(1),
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            window=window,
+            return_complex=True,
+            center=True,
+        )
+
+    def istft(self, X, length):
+        window = self.window.to(device=X.device, dtype=X.real.dtype)
+        return torch.istft(
+            X,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            window=window,
+            length=length,
+            center=True,
+        ).unsqueeze(1)
+
+    def _shift_with_zero_pad(self, x, shift):
+        if shift == 0:
+            return x
+
+        B, F, T = x.shape
+        if shift > 0:
+            pad = x.new_zeros(B, F, shift)
+            return torch.cat([pad, x[..., :-shift]], dim=-1)
+        else:
+            s = -shift
+            pad = x.new_zeros(B, F, s)
+            return torch.cat([x[..., s:], pad], dim=-1)
+
+    def forward(self, x_feat, x_wave):
+        X = self.stft(x_wave)
+        n_bins = min(self.df_bins, X.shape[1])
+        X_low = X[:, :n_bins, :]
+        T_spec = X_low.shape[-1]
+
+        x_feat = F.interpolate(
+            x_feat,
+            size=T_spec,
+            mode="linear",
+            align_corners=False
+        )
+
+        B = x_feat.shape[0]
+
+        df_coef = self.df_proj(x_feat)
+        df_coef = df_coef.view(
+            B, self.df_bins, self.df_order, 2, T_spec
+        )[:, :n_bins].permute(0, 1, 2, 4, 3)
+
+        df_coef = torch.complex(df_coef[..., 0], df_coef[..., 1])
+        alpha = torch.sigmoid(self.alpha_proj(x_feat))
+
+        Y_df = X_low.new_zeros(X_low.shape)
+
+        for i in range(self.df_order):
+            shift = i - self.lookahead
+            X_shift = self._shift_with_zero_pad(X_low, shift)
+            Y_df = Y_df + df_coef[:, :, i, :] * X_shift
+    
+        Y = alpha * Y_df + (1.0 - alpha) * X_low
+        X_out = X.clone()
+        X_out[:, :n_bins, :] = Y
+
+        y = self.istft(X_out, length=x_wave.shape[-1])
+        return y
 
 
 class HiFiPlusGenerator(torch.nn.Module):
@@ -278,7 +363,7 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
         waveunet_block_widths=(10, 20, 40, 80),
         waveunet_block_depth=4,
 
-        use_spectralmasknet=True,
+        use_spectralmasknet=False,
         spectralmasknet_block_widths=(8, 12, 24, 32),
         spectralmasknet_block_depth=4,
 
@@ -314,6 +399,8 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
             norm_type=norm_type,
             use_skip_connect=use_skip_connect,
             waveunet_before_spectralmasknet=waveunet_before_spectralmasknet,
+
+            df_head_config=None
         )
 
         self.waveunet_input = waveunet_input
@@ -331,6 +418,14 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
                     1 + self.hifi.out_channels, self.hifi.out_channels, 1
                 )
             )
+
+        self.use_spectralmasknet = False
+
+        df_head_config = df_head_config or {}
+        self.df_head = DFHead(
+            in_channels=self.hifi.out_channels,
+            **df_head_config,
+        )
         
     @staticmethod
     def get_melspec(x):
@@ -365,294 +460,24 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
         return x
 
     def forward(self, x):
-        x_orig = x.clone()
-        x_orig = x_orig[:, :, : x_orig.shape[2] // 1024 * 1024]
-        x = self.get_melspec(x_orig)
+        input_len = x.shape[-1]
+        x_orig = x
+        x_mel_in = x_orig[:, :, : x_orig.shape[2] // 1024 * 1024]
+        x = self.get_melspec(x_mel_in)
         x = self.apply_spectralunet(x)
         x = self.hifi(x)
+
         if self.use_waveunet and self.waveunet_before_spectralmasknet:
-            x = self.apply_waveunet_a2a(x, x_orig)
-        if self.use_spectralmasknet:
-            x = self.apply_spectralmasknet(x)
+            x = self.apply_waveunet_a2a(x, x_mel_in)
         if self.use_waveunet and not self.waveunet_before_spectralmasknet:
-            x = self.apply_waveunet_a2a(x, x_orig)
-
-        x = self.conv_post(x)
-        x = torch.tanh(x)
-
-        return x
-
-
-class HiFiPlusGeneratorBWE(torch.nn.Module):
-    def __init__(
-        self,
-
-        use_spectralunet=True,
-        spectralunet_block_widths=(8, 16, 24, 32, 64),
-        spectralunet_block_depth=5,
-        spectralunet_positional_encoding=True,
-
-        use_waveunet=True,
-        waveunet_block_widths=(10, 20, 40, 80),
-        waveunet_block_depth=4,
-
-        use_spectralmasknet=True,
-        spectralmasknet_block_widths=(8, 12, 24, 32),
-        spectralmasknet_block_depth=4,
-
-        norm_type: Literal["weight", "spectral"] = "weight",
-        use_skip_connect=True,
-        waveunet_before_spectralmasknet=True,
-        ConvNeXt_channels = 512,
-        ConvNeXt_layers = 8,
-        n_fft = 1024, 
-        hop_size = 256,
-        win_size = 1024,
-
-    ):
-        super().__init__()
-
-        self.n_fft = n_fft
-        self.hop_size = hop_size
-        self.win_size = win_size
-        self.norm = dict(weight=weight_norm, spectral=spectral_norm)[norm_type]
-        self.norm_type = norm_type
-
-        self.use_spectralunet = use_spectralunet
-        self.use_waveunet = use_waveunet
-        self.use_spectralmasknet = use_spectralmasknet
-
-        self.use_skip_connect = use_skip_connect
-        self.waveunet_before_spectralmasknet = waveunet_before_spectralmasknet
-
-        self.bwe_blocks = nn_utils.APNet_BWE_Model(ConvNeXt_channels=ConvNeXt_channels, ConvNeXt_layers=ConvNeXt_layers, n_fft=n_fft)
-
-        # ch = self.hifi.out_channels
-        ch = 8
-
-        if self.use_spectralunet:
-            self.spectralunet = nn_utils.SpectralUNet(
-                block_widths=spectralunet_block_widths,
-                block_depth=spectralunet_block_depth,
-                positional_encoding=spectralunet_positional_encoding,
-                norm_type=norm_type,
-            )
-
-        if self.use_waveunet:
-            self.waveunet = nn_utils.MultiScaleResnet(
-                waveunet_block_widths,
-                waveunet_block_depth,
-                mode="waveunet_k5",
-                out_width=ch,
-                in_width=ch,
-                norm_type=norm_type
-            )
-
-        if self.use_spectralmasknet:
-            self.spectralmasknet = nn_utils.SpectralMaskNet(
-                in_ch=ch,
-                block_widths=spectralmasknet_block_widths,
-                block_depth=spectralmasknet_block_depth,
-                norm_type=norm_type
-            )
-
-        self.waveunet_skip_connect = None
-        self.spectralmasknet_skip_connect = None
-        if self.use_skip_connect:
-            self.make_waveunet_skip_connect(ch)
-            self.make_spectralmasknet_skip_connect(ch)
-
-        self.conv_post = None
-        self.make_conv_post(ch)
-
-    def make_waveunet_skip_connect(self, ch):
-        self.waveunet_skip_connect = self.norm(nn.Conv1d(ch, ch, 1, 1))
-        self.waveunet_skip_connect.weight.data = torch.eye(ch, ch).unsqueeze(-1)
-        self.waveunet_skip_connect.bias.data.fill_(0.0)
-
-    def make_spectralmasknet_skip_connect(self, ch):
-        self.spectralmasknet_skip_connect = self.norm(nn.Conv1d(ch, ch, 1, 1))
-        self.spectralmasknet_skip_connect.weight.data = torch.eye(ch, ch).unsqueeze(-1)
-        self.spectralmasknet_skip_connect.bias.data.fill_(0.0)
-
-    def make_conv_post(self, ch):
-        self.conv_post = self.norm(nn.Conv1d(ch, 1, 7, 1, padding=3))
-        self.conv_post.apply(nn_utils.init_weights)
-
-    def apply_spectralunet(self, x_orig):
-        if self.use_spectralunet:
-            pad_size = (
-                closest_power_of_two(x_orig.shape[-1]) - x_orig.shape[-1]
-            )
-            x = torch.nn.functional.pad(x_orig, (0, pad_size))
-            x = self.spectralunet(x)
-            x = x[..., : x_orig.shape[-1]]
-        else:
-            x = x_orig.squeeze(1)
-        return x
-
-    def apply_waveunet(self, x):
-        x_a = x
-        x = self.waveunet(x_a)
-        if self.use_skip_connect:
-            x += self.waveunet_skip_connect(x_a)
-        return x
-
-    def apply_spectralmasknet(self, x):
-        x_a = x
-        x = self.spectralmasknet(x)
-        if self.use_skip_connect:
-            x += self.spectralmasknet_skip_connect(x_a)
-        return x
-
-    def forward(self, x_orig):
-        x = self.apply_spectralunet(x_orig)
-        mag, pha, com = amp_pha_stft(x, self.n_fft, self.hop_size, self.win_size)
-            
-        mag_wb_g, pha_wb_g, com_wb_g = self.bwe_blocks(mag, pha)
-
-        x = amp_pha_istft(mag_wb_g, pha_wb_g, self.n_fft, self.hop_size, self.win_size)
-        if self.use_waveunet and self.waveunet_before_spectralmasknet:
-            x = self.apply_waveunet(x)
-        if self.use_spectralmasknet:
-            x = self.apply_spectralmasknet(x)
-        if self.use_waveunet and not self.waveunet_before_spectralmasknet:
-            x = self.apply_waveunet(x)
-
-        x = self.conv_post(x)
-        x = torch.tanh(x)
-
-        return x
-
-class A2AHiFiPlusGeneratorBWEV2(HiFiPlusGeneratorBWE):
-    def __init__(
-        self,
-
-
-        use_spectralunet=True,
-        spectralunet_block_widths=(8, 16, 24, 32, 64),
-        spectralunet_block_depth=5,
-        spectralunet_positional_encoding=True,
-
-        use_waveunet=True,
-        waveunet_block_widths=(10, 20, 40, 80),
-        waveunet_block_depth=4,
-
-        use_spectralmasknet=True,
-        spectralmasknet_block_widths=(8, 12, 24, 32),
-        spectralmasknet_block_depth=4,
-
-        norm_type: Literal["weight", "spectral"] = "weight",
-        use_skip_connect=True,
-        waveunet_before_spectralmasknet=True,
-
-        waveunet_input: Literal["waveform", "hifi", "both"] = "both",
-    ):
-        super().__init__(
-            use_spectralunet=use_spectralunet,
-            spectralunet_block_widths=spectralunet_block_widths,
-            spectralunet_block_depth=spectralunet_block_depth,
-            spectralunet_positional_encoding=spectralunet_positional_encoding,
-
-            use_waveunet=use_waveunet,
-            waveunet_block_widths=waveunet_block_widths,
-            waveunet_block_depth=waveunet_block_depth,
-
-            use_spectralmasknet=use_spectralmasknet,
-            spectralmasknet_block_widths=spectralmasknet_block_widths,
-            spectralmasknet_block_depth=spectralmasknet_block_depth,
-
-            norm_type=norm_type,
-            use_skip_connect=use_skip_connect,
-            waveunet_before_spectralmasknet=waveunet_before_spectralmasknet,
-        )
-
-        self.waveunet_input = waveunet_input
-
-        self.waveunet_conv_pre = None
-        if self.waveunet_input == "waveform":
-            self.waveunet_conv_pre = weight_norm(
-                nn.Conv1d(
-                    # 1, self.hifi.out_channels, 1
-                    1, 8, 1
-                )
-            )
-        elif self.waveunet_input == "both":
-            self.waveunet_conv_pre = weight_norm(
-                nn.Conv1d(
-                    # 1 + self.hifi.out_channels, self.hifi.out_channels, 1
-                    1 + 8, 8, 1
-                )
-            )
-        
-    @staticmethod
-    def get_melspec(x):
-        shape = x.shape
-        x = x.view(shape[0] * shape[1], shape[2])
-        x = mel_spectrogram(x, 1024, 80, 16000, 256, 1024, 0, 8000)
-        x = x.view(shape[0], -1, x.shape[-1])
-        return x
-    
-
-    def apply_waveunet_a2a(self, x, x_orig):
-        if self.waveunet_input == "waveform":
-            x_a = self.waveunet_conv_pre(x_orig)
-        elif self.waveunet_input == "both":
-            x_a = torch.cat([x, x_orig], 1)
-            x_a = self.waveunet_conv_pre(x_a)
-        elif self.waveunet_input == "hifi":
-            x_a = x
-        else:
-            raise ValueError
-        x = self.waveunet(x_a)
-        if self.use_skip_connect:
-            x += self.waveunet_skip_connect(x_a)
-        return x
-
-    def forward(self, x):
-        x_orig = x
-        x_orig = x_orig[:, :, : x_orig.shape[2] // 1024 * 1024]
-
-        wav_1d = x_orig.squeeze(1)
-        log_mag, pha, _ = amp_pha_stft(
-            wav_1d,
-            n_fft=self.n_fft,
-            hop_size=self.hop_size,
-            win_size=self.win_size,
-            center=True,
-        )
-        mag_wb_g, pha_wb_g, _ = self.bwe_blocks(log_mag, pha)  # [B, 513, frames]
-
-        wav_bwe = amp_pha_istft(
-            mag_wb_g,
-            pha_wb_g,
-            n_fft=self.n_fft,
-            hop_size=self.hop_size,
-            win_size=self.win_size,
-            center=True,
-        )
-        wav_bwe = wav_bwe.unsqueeze(1)
-        x = wav_bwe
-
-        if self.use_waveunet and self.waveunet_before_spectralmasknet:
-            if self.waveunet_input == "waveform":
-                x = self.apply_waveunet_a2a(x, wav_bwe)
+            x = self.apply_waveunet_a2a(x, x_mel_in)
+        x = self.df_head(x, x_mel_in)
+        if x.shape[-1] != input_len:
+            if x.shape[-1] > input_len:
+                x = x[..., :input_len]
             else:
-                x_feat = x.repeat(1, 8, 1)  # [B,8,T']
-                x = self.apply_waveunet_a2a(x_feat, wav_bwe)
+                x = F.pad(x, (0, input_len - x.shape[-1]))
 
-        if self.use_spectralmasknet:
-            x = self.apply_spectralmasknet(x)
-
-        if self.use_waveunet and not self.waveunet_before_spectralmasknet:
-            if self.waveunet_input == "waveform":
-                x = self.apply_waveunet_a2a(x, wav_bwe)
-            else:
-                x_feat = x.repeat(1, 8, 1) if x.shape[1] == 1 else x
-                x = self.apply_waveunet_a2a(x_feat, wav_bwe)
-
-        x = self.conv_post(x)
-        x = torch.tanh(x)
         return x
 
 import torch.nn as nn

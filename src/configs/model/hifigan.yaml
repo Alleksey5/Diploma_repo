@@ -1,4 +1,5 @@
-_target_: src.model.hifigan.HiFiGAN 
+_target_: src.model.hifigan.HiFiGAN
+
 generator_config:
   hifi_resblock: "1"
   hifi_upsample_rates: [8, 8, 2, 2]
@@ -9,26 +10,36 @@ generator_config:
   hifi_input_channels: 128
   hifi_conv_pre_kernel_size: 1
 
-  use_spectralunet: True
+  use_spectralunet: true
   spectralunet_block_widths: [8, 16, 24, 32, 64]
   spectralunet_block_depth: 5
-  spectralunet_positional_encoding: True
+  spectralunet_positional_encoding: true
 
-  use_waveunet: True
+  use_waveunet: true
   waveunet_block_widths: [10, 20, 40, 80]
   waveunet_block_depth: 4
+  waveunet_input: "both"
+
+  use_spectralmasknet: false
 
   norm_type: "weight"
-  use_skip_connect: True
-  waveunet_input: "both"
-  
-mpd_config: 
+  use_skip_connect: true
+  waveunet_before_spectralmasknet: true
+
+  df_head_config:
+    n_fft: 1024
+    hop_length: 256
+    df_bins: 128
+    df_order: 5
+    lookahead: 1
+
+mpd_config:
   periods: [2, 3, 5, 7, 11]
   kernel_size: 5
   stride: 3
   channels: [1, 32, 128, 512, 1024]
 
-msd_config: 
+msd_config:
   num_blocks: 3
   kernel_sizes: [15, 41, 41, 41, 41, 41, 5]
   strides: [1, 2, 2, 4, 4, 1, 1]
