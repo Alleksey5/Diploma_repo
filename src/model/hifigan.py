@@ -16,6 +16,8 @@ import src.utils.nn_utils as nn_utils
 from librosa.filters import mel as librosa_mel_fn
 import numpy as np
 
+from src.model.deep_filter_net import DeepFilterNetWrapper
+
 
 
 def amp_pha_stft(audio, n_fft, hop_size, win_size, center=True):
@@ -138,6 +140,8 @@ class HiFiPlusGenerator(torch.nn.Module):
         spectralmasknet_block_widths=(8, 12, 24, 32),
         spectralmasknet_block_depth=4,
 
+        use_deepfilternet=True,
+
         norm_type: Literal["weight", "spectral"] = "weight",
         use_skip_connect=True,
         waveunet_before_spectralmasknet=True,
@@ -149,6 +153,7 @@ class HiFiPlusGenerator(torch.nn.Module):
         self.use_spectralunet = use_spectralunet
         self.use_waveunet = use_waveunet
         self.use_spectralmasknet = use_spectralmasknet
+        self.use_deepfilternet = use_deepfilternet
 
         self.use_skip_connect = use_skip_connect
         self.waveunet_before_spectralmasknet = waveunet_before_spectralmasknet
@@ -200,6 +205,8 @@ class HiFiPlusGenerator(torch.nn.Module):
 
         self.conv_post = None
         self.make_conv_post(ch)
+        if self.use_deepfilternet:
+            self.deepfilternet = DeepFilterNetWrapper()
 
     def make_waveunet_skip_connect(self, ch):
         self.waveunet_skip_connect = self.norm(nn.Conv1d(ch, ch, 1, 1))
@@ -254,6 +261,10 @@ class HiFiPlusGenerator(torch.nn.Module):
         x = self.conv_post(x)
         x = torch.tanh(x)
 
+        if self.use_deepfilternet:
+            x = self.deepfilternet(x)
+            x = torch.tanh(x)
+
         return x
 
 
@@ -281,6 +292,8 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
         use_spectralmasknet=True,
         spectralmasknet_block_widths=(8, 12, 24, 32),
         spectralmasknet_block_depth=4,
+
+        use_deepfilternet=True,
 
         norm_type: Literal["weight", "spectral"] = "weight",
         use_skip_connect=True,
@@ -310,6 +323,8 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
             use_spectralmasknet=use_spectralmasknet,
             spectralmasknet_block_widths=spectralmasknet_block_widths,
             spectralmasknet_block_depth=spectralmasknet_block_depth,
+
+            use_deepfilternet=use_deepfilternet,
 
             norm_type=norm_type,
             use_skip_connect=use_skip_connect,
@@ -379,6 +394,10 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
 
         x = self.conv_post(x)
         x = torch.tanh(x)
+
+        if self.use_deepfilternet:
+            x = self.deepfilternet(x)
+            x = torch.tanh(x)
 
         return x
 
