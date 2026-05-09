@@ -897,3 +897,93 @@ class DeepFilterNetWrapper(nn.Module):
         )
 
         return enhanced_wav.unsqueeze(1)
+
+class FeatureDeepFilterNet(nn.Module):
+    def __init__(
+        self,
+        in_ch: int,
+        df_bins: Optional[int] = None,
+        df_order: int = 5,
+        hidden_ch: int = 128,
+        gru_layers: int = 1,
+        df_lookahead: int = 0,
+        dfop_method: str = "real_unfold",
+    ):
+        super().__init__()
+
+        self.in_ch = in_ch
+        self.df_bins = df_bins or in_ch
+        self.df_order = df_order
+
+        self.to_df = nn.Conv1d(in_ch, self.df_bins * 2, kernel_size=1)
+
+        self.encoder = nn.Sequential(
+            nn.Conv1d(in_ch, hidden_ch, kernel_size=5, padding=2),
+            nn.BatchNorm1d(hidden_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_ch, hidden_ch, kernel_size=5, padding=2),
+            nn.BatchNorm1d(hidden_ch),
+            nn.ReLU(inplace=True),
+        )
+
+        self.gru = nn.GRU(
+            input_size=hidden_ch,
+            hidden_size=hidden_ch,
+            num_layers=gru_layers,
+            batch_first=True,
+        )
+
+        self.coef_out = nn.Sequential(
+            nn.Linear(hidden_ch, self.df_bins * df_order * 2),
+            nn.Tanh(),
+        )
+
+        self.alpha_out = nn.Sequential(
+            nn.Linear(hidden_ch, 1),
+            nn.Sigmoid(),
+        )
+
+        self.df_op = DfOp(
+            df_bins=self.df_bins,
+            df_order=df_order,
+            df_lookahead=df_lookahead,
+            method=dfop_method,
+            freq_bins=self.df_bins,
+        )
+
+        self.from_df = nn.Conv1d(self.df_bins * 2, in_ch, kernel_size=1)
+
+        nn.init.normal_(self.from_df.weight, mean=0.0, std=1e-4)
+        nn.init.zeros_(self.from_df.bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        x: [B, ch, T]
+        return: delta/features [B, ch, T]
+        """
+        b, _, t = x.shape
+
+        z = self.to_df(x)
+        z = z.transpose(1, 2).contiguous()
+        z = z.view(b, t, self.df_bins, 2)
+        spec = z.unsqueeze(1)
+
+        h = self.encoder(x)
+        h = h.transpose(1, 2).contiguous()
+        h, _ = self.gru(h)
+
+        coefs = self.coef_out(h)
+        coefs = coefs.view(
+            b, t, self.df_order, self.df_bins, 2
+        )
+
+        alpha = self.alpha_out(h)
+
+        spec = self.df_op(spec, coefs, alpha)
+
+        y = spec.squeeze(1).contiguous()
+        y = y.view(b, t, self.df_bins * 2)
+        y = y.transpose(1, 2).contiguous()
+
+        y = self.from_df(y)
+        return y

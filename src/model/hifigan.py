@@ -16,7 +16,7 @@ import src.utils.nn_utils as nn_utils
 from librosa.filters import mel as librosa_mel_fn
 import numpy as np
 
-from src.model.deep_filter_net import DeepFilterNetWrapper
+from src.model.deep_filter_net import DeepFilterNetWrapper, FeatureDeepFilterNet
 
 
 
@@ -141,6 +141,7 @@ class HiFiPlusGenerator(torch.nn.Module):
         spectralmasknet_block_depth=4,
 
         use_deepfilternet=True,
+        use_feature_deepfilternet=False,
 
         norm_type: Literal["weight", "spectral"] = "weight",
         use_skip_connect=True,
@@ -154,6 +155,7 @@ class HiFiPlusGenerator(torch.nn.Module):
         self.use_waveunet = use_waveunet
         self.use_spectralmasknet = use_spectralmasknet
         self.use_deepfilternet = use_deepfilternet
+        self.use_feature_deepfilternet = use_feature_deepfilternet
 
         self.use_skip_connect = use_skip_connect
         self.waveunet_before_spectralmasknet = waveunet_before_spectralmasknet
@@ -195,6 +197,14 @@ class HiFiPlusGenerator(torch.nn.Module):
                 block_widths=spectralmasknet_block_widths,
                 block_depth=spectralmasknet_block_depth,
                 norm_type=norm_type
+            )
+
+        if self.use_feature_deepfilternet:
+            self.feature_deepfilternet = FeatureDeepFilterNet(
+                in_ch=ch,
+                df_bins=ch,
+                df_order=5,
+                hidden_ch=128,
             )
 
         self.waveunet_skip_connect = None
@@ -248,6 +258,13 @@ class HiFiPlusGenerator(torch.nn.Module):
             x += self.spectralmasknet_skip_connect(x_a)
         return x
 
+    def apply_feature_deepfilternet(self, x):
+        x_a = x
+        x = self.feature_deepfilternet(x)
+        if self.use_skip_connect:
+            x += self.spectralmasknet_skip_connect(x_a)
+        return x
+
     def forward(self, x_orig):
         x = self.apply_spectralunet(x_orig)
         x = self.hifi(x)
@@ -294,6 +311,7 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
         spectralmasknet_block_depth=4,
 
         use_deepfilternet=True,
+        use_feature_deepfilternet=False,
 
         norm_type: Literal["weight", "spectral"] = "weight",
         use_skip_connect=True,
@@ -325,6 +343,7 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
             spectralmasknet_block_depth=spectralmasknet_block_depth,
 
             use_deepfilternet=use_deepfilternet,
+            use_feature_deepfilternet=use_feature_deepfilternet,
 
             norm_type=norm_type,
             use_skip_connect=use_skip_connect,
@@ -389,6 +408,8 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
             x = self.apply_waveunet_a2a(x, x_orig)
         if self.use_spectralmasknet:
             x = self.apply_spectralmasknet(x)
+        if self.use_feature_deepfilternet:
+            x = self.apply_feature_deepfilternet(x)
         if self.use_waveunet and not self.waveunet_before_spectralmasknet:
             x = self.apply_waveunet_a2a(x, x_orig)
 

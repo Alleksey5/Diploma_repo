@@ -19,7 +19,8 @@ generator_config:
   waveunet_block_depth: 4
 
   use_spectralmasknet: False
-  use_deepfilternet: True
+  use_deepfilternet: False
+  use_feature_deepfilternet: True
 
   norm_type: "weight"
   use_skip_connect: True
