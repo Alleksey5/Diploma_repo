@@ -16,9 +16,11 @@ import src.utils.nn_utils as nn_utils
 from librosa.filters import mel as librosa_mel_fn
 import numpy as np
 
-from src.model.deep_filter_net import DeepFilterNetWrapper, FeatureDeepFilterNet
-
-
+from src.model.deep_filter_net import (
+    DeepFilterNetWrapper,
+    FeatureDeepFilterNet,
+    DeepFilterEncoderBranch,
+)
 
 def amp_pha_stft(audio, n_fft, hop_size, win_size, center=True):
 
@@ -142,6 +144,7 @@ class HiFiPlusGenerator(torch.nn.Module):
 
         use_deepfilternet=True,
         use_feature_deepfilternet=False,
+        use_df_encoder_branch=False,
 
         norm_type: Literal["weight", "spectral"] = "weight",
         use_skip_connect=True,
@@ -156,6 +159,7 @@ class HiFiPlusGenerator(torch.nn.Module):
         self.use_spectralmasknet = use_spectralmasknet
         self.use_deepfilternet = use_deepfilternet
         self.use_feature_deepfilternet = use_feature_deepfilternet
+        self.use_df_encoder_branch = use_df_encoder_branch
 
         self.use_skip_connect = use_skip_connect
         self.waveunet_before_spectralmasknet = waveunet_before_spectralmasknet
@@ -172,6 +176,9 @@ class HiFiPlusGenerator(torch.nn.Module):
             norm_type=norm_type,
         )
         ch = self.hifi.out_channels
+
+        if self.use_df_encoder_branch:
+            self.df_encoder_branch = DeepFilterEncoderBranch(out_ch=ch)
 
         if self.use_spectralunet:
             self.spectralunet = nn_utils.SpectralUNet(
@@ -312,6 +319,7 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
 
         use_deepfilternet=True,
         use_feature_deepfilternet=False,
+        use_df_encoder_branch=False,
 
         norm_type: Literal["weight", "spectral"] = "weight",
         use_skip_connect=True,
@@ -344,6 +352,7 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
 
             use_deepfilternet=use_deepfilternet,
             use_feature_deepfilternet=use_feature_deepfilternet,
+            use_df_encoder_branch=use_df_encoder_branch,
 
             norm_type=norm_type,
             use_skip_connect=use_skip_connect,
@@ -404,6 +413,8 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
         x = self.get_melspec(x_orig)
         x = self.apply_spectralunet(x)
         x = self.hifi(x)
+        if self.use_df_encoder_branch:
+            x = x + self.df_encoder_branch(x_orig, target_len=x.shape[-1])
         if self.use_waveunet and self.waveunet_before_spectralmasknet:
             x = self.apply_waveunet_a2a(x, x_orig)
         if self.use_spectralmasknet:

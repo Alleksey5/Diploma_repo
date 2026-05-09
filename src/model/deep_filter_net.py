@@ -987,3 +987,98 @@ class FeatureDeepFilterNet(nn.Module):
 
         y = self.from_df(y)
         return y
+
+class DeepFilterEncoderBranch(nn.Module):
+    def __init__(
+        self,
+        out_ch: int,
+        sr: int = 16000,
+        n_fft: int = 1024,
+        hop_length: int = 256,
+        nb_erb: int = 32,
+        nb_df: int = 96,
+    ):
+        super().__init__()
+
+        self.sr = sr
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.nb_erb = nb_erb
+        self.nb_df = nb_df
+
+        self.register_buffer("window", torch.hann_window(n_fft))
+
+        erb_widths = self._make_erb_widths(n_fft // 2 + 1, nb_erb)
+        self.register_buffer("erb_fb", erb_fb(erb_widths, sr, inverse=False))
+
+        self.encoder = Encoder()
+
+        p = ModelParams()
+        self.proj = nn.Sequential(
+            nn.Conv1d(p.emb_hidden_dim, out_ch, kernel_size=1),
+            nn.Tanh(),
+        )
+
+        nn.init.normal_(self.proj[0].weight, mean=0.0, std=1e-4)
+        nn.init.zeros_(self.proj[0].bias)
+
+    def _make_erb_widths(self, n_freqs: int, nb_erb: int) -> np.ndarray:
+        widths = np.full(nb_erb, n_freqs // nb_erb, dtype=np.int64)
+        widths[: n_freqs % nb_erb] += 1
+        return widths
+
+    def _make_features(self, x_complex: Tensor):
+        # x_complex: [B, T, F]
+        mag2 = x_complex.abs().pow(2)
+
+        erb = torch.matmul(
+            mag2,
+            self.erb_fb.to(x_complex.device, x_complex.real.dtype),
+        )
+        feat_erb = torch.log(erb.clamp_min(1e-8)).unsqueeze(1)
+
+        spec_df = x_complex[..., : self.nb_df]
+        mean = spec_df.abs().mean(dim=(1, 2), keepdim=True).clamp_min(1e-8)
+        spec_df = spec_df / mean
+
+        feat_spec = torch.view_as_real(spec_df).unsqueeze(1)
+        feat_spec = feat_spec.transpose(1, 4).squeeze(4)
+
+        return feat_erb, feat_spec
+
+    def forward(self, wav: Tensor, target_len: int) -> Tensor:
+        """
+        wav: [B, 1, T] или [B, T]
+        return: [B, out_ch, target_len]
+        """
+        if wav.dim() == 3:
+            wav = wav.squeeze(1)
+
+        window = self.window.to(wav.device, wav.dtype)
+
+        spec_complex = torch.stft(
+            wav,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            window=window,
+            return_complex=True,
+            center=True,
+        )
+
+        spec_complex = spec_complex.transpose(1, 2).contiguous()
+
+        feat_erb, feat_spec = self._make_features(spec_complex)
+
+        _, _, _, _, emb, _, _ = self.encoder(feat_erb, feat_spec)
+
+        cond = emb.transpose(1, 2).contiguous()
+        cond = self.proj(cond)
+
+        cond = F.interpolate(
+            cond,
+            size=target_len,
+            mode="linear",
+            align_corners=False,
+        )
+
+        return cond

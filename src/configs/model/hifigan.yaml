@@ -20,7 +20,8 @@ generator_config:
 
   use_spectralmasknet: False
   use_deepfilternet: False
-  use_feature_deepfilternet: True
+  use_feature_deepfilternet: False
+  use_df_encoder_branch: True
 
   norm_type: "weight"
   use_skip_connect: True
