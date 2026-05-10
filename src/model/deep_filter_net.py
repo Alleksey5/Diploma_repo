@@ -1082,3 +1082,123 @@ class DeepFilterEncoderBranch(nn.Module):
         )
 
         return cond
+
+class ConditionedDeepFilterNetWrapper(nn.Module):
+    def __init__(self, cond_ch: int):
+        super().__init__()
+        p = ModelParams()
+
+        self.sr = p.sr
+        self.n_fft = p.fft_size
+        self.hop_length = p.hop_size
+        self.nb_erb = p.nb_erb
+        self.nb_df = p.nb_df
+
+        self.register_buffer("window", torch.hann_window(self.n_fft))
+
+        erb_widths = self._make_erb_widths(self.n_fft // 2 + 1, self.nb_erb)
+        erb_inv = erb_fb(erb_widths, self.sr, inverse=True)
+
+        self.register_buffer("erb_fb", erb_fb(erb_widths, self.sr, inverse=False))
+
+        self.enc = Encoder()
+        self.erb_dec = ErbDecoder()
+        self.mask = Mask(erb_inv, post_filter=p.mask_pf)
+
+        self.df_dec = DfDecoder()
+        self.df_op = DfOp(
+            p.nb_df,
+            p.df_order,
+            p.df_lookahead,
+            freq_bins=p.fft_size // 2 + 1,
+            method=p.dfop_method,
+        )
+
+        self.cond_proj = nn.Conv1d(cond_ch, p.emb_hidden_dim, kernel_size=1)
+
+        nn.init.normal_(self.cond_proj.weight, mean=0.0, std=1e-4)
+        nn.init.zeros_(self.cond_proj.bias)
+
+        self.mix = nn.Parameter(torch.tensor(0.1))
+
+    def _make_erb_widths(self, n_freqs: int, nb_erb: int) -> np.ndarray:
+        widths = np.full(nb_erb, n_freqs // nb_erb, dtype=np.int64)
+        widths[: n_freqs % nb_erb] += 1
+        return widths
+
+    def _make_features(self, x_complex: Tensor):
+        mag2 = x_complex.abs().pow(2)
+
+        erb = torch.matmul(
+            mag2,
+            self.erb_fb.to(x_complex.device, x_complex.real.dtype),
+        )
+        feat_erb = torch.log(erb.clamp_min(1e-8)).unsqueeze(1)
+
+        spec_df = x_complex[..., : self.nb_df]
+        mean = spec_df.abs().mean(dim=(1, 2), keepdim=True).clamp_min(1e-8)
+        spec_df = spec_df / mean
+
+        feat_spec = torch.view_as_real(spec_df).unsqueeze(1)
+        feat_spec = feat_spec.transpose(1, 4).squeeze(4)
+
+        return feat_erb, feat_spec
+
+    def forward(self, wav_bwe: Tensor, cond: Tensor) -> Tensor:
+        """
+        wav_bwe: [B, 1, T]
+        cond:    [B, C, T_cond] — признаки генератора перед conv_post
+        """
+        if wav_bwe.dim() == 3:
+            wav_1d = wav_bwe.squeeze(1)
+        else:
+            wav_1d = wav_bwe
+
+        length = wav_1d.shape[-1]
+        window = self.window.to(wav_1d.device, wav_1d.dtype)
+
+        spec_complex = torch.stft(
+            wav_1d,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            window=window,
+            return_complex=True,
+            center=True,
+        )
+
+        spec_complex = spec_complex.transpose(1, 2).contiguous()
+        spec = torch.view_as_real(spec_complex).unsqueeze(1)
+
+        feat_erb, feat_spec = self._make_features(spec_complex)
+
+        e0, e1, e2, e3, emb, c0, _ = self.enc(feat_erb, feat_spec)
+
+        cond = F.interpolate(
+            cond,
+            size=emb.shape[1],
+            mode="linear",
+            align_corners=False,
+        )
+        cond = self.cond_proj(cond).transpose(1, 2).contiguous()
+
+        emb = emb + cond
+
+        m = self.erb_dec(emb, e3, e2, e1, e0)
+        spec = self.mask(spec, m)
+
+        df_coefs, df_alpha = self.df_dec(emb, c0)
+        spec = self.df_op(spec, df_coefs, df_alpha)
+
+        enhanced_complex = torch.view_as_complex(spec.squeeze(1).contiguous())
+        enhanced_complex = enhanced_complex.transpose(1, 2).contiguous()
+
+        enhanced = torch.istft(
+            enhanced_complex,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            window=window,
+            length=length,
+            center=True,
+        ).unsqueeze(1)
+
+        return wav_bwe + self.mix * (enhanced - wav_bwe)

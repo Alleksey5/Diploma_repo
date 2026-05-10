@@ -20,6 +20,7 @@ from src.model.deep_filter_net import (
     DeepFilterNetWrapper,
     FeatureDeepFilterNet,
     DeepFilterEncoderBranch,
+    ConditionedDeepFilterNetWrapper,
 )
 
 def amp_pha_stft(audio, n_fft, hop_size, win_size, center=True):
@@ -145,6 +146,7 @@ class HiFiPlusGenerator(torch.nn.Module):
         use_deepfilternet=True,
         use_feature_deepfilternet=False,
         use_df_encoder_branch=False,
+        use_conditioned_deepfilternet=False,
 
         norm_type: Literal["weight", "spectral"] = "weight",
         use_skip_connect=True,
@@ -160,6 +162,7 @@ class HiFiPlusGenerator(torch.nn.Module):
         self.use_deepfilternet = use_deepfilternet
         self.use_feature_deepfilternet = use_feature_deepfilternet
         self.use_df_encoder_branch = use_df_encoder_branch
+        self.use_conditioned_deepfilternet = use_conditioned_deepfilternet
 
         self.use_skip_connect = use_skip_connect
         self.waveunet_before_spectralmasknet = waveunet_before_spectralmasknet
@@ -176,6 +179,9 @@ class HiFiPlusGenerator(torch.nn.Module):
             norm_type=norm_type,
         )
         ch = self.hifi.out_channels
+
+        if self.use_conditioned_deepfilternet:
+            self.conditioned_deepfilternet = ConditionedDeepFilterNetWrapper(cond_ch=ch)
 
         if self.use_df_encoder_branch:
             self.df_encoder_branch = DeepFilterEncoderBranch(out_ch=ch)
@@ -320,6 +326,7 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
         use_deepfilternet=True,
         use_feature_deepfilternet=False,
         use_df_encoder_branch=False,
+        use_conditioned_deepfilternet=False,
 
         norm_type: Literal["weight", "spectral"] = "weight",
         use_skip_connect=True,
@@ -353,6 +360,7 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
             use_deepfilternet=use_deepfilternet,
             use_feature_deepfilternet=use_feature_deepfilternet,
             use_df_encoder_branch=use_df_encoder_branch,
+            use_conditioned_deepfilternet=use_conditioned_deepfilternet,
 
             norm_type=norm_type,
             use_skip_connect=use_skip_connect,
@@ -424,8 +432,14 @@ class A2AHiFiPlusGeneratorV2(HiFiPlusGenerator):
         if self.use_waveunet and not self.waveunet_before_spectralmasknet:
             x = self.apply_waveunet_a2a(x, x_orig)
 
+        cond = x
+
         x = self.conv_post(x)
         x = torch.tanh(x)
+
+        if self.use_conditioned_deepfilternet:
+            x = self.conditioned_deepfilternet(x, cond)
+            x = torch.tanh(x)
 
         if self.use_deepfilternet:
             x = self.deepfilternet(x)
