@@ -1,75 +1,272 @@
-# HiFi++: Исследование и стриминговое восстановление аудио
+# \# HiFi++ and Deep Filtering for Speech Bandwidth Extension
 
-## Описание проекта
+# 
 
-Данный репозиторий содержит реализацию и исследование нейросетевой архитектуры **HiFi++**, предназначенной для задач **восстановления пропущенных высокочастотных компонент аудиосигнала (Bandwidth Extension)** и **улучшения качества речи (Speech Enhancement)**.
+# \## Overview
 
-Модель HiFi++ объединяет U-Net-блоки для спектральной и временной обработки, а также включает модули постобработки, что позволяет достигать высокой точности и естественности восстановленного аудио. Помимо оффлайн-обработки, в проекте реализован **стриминговый режим инференса**, имитирующий работу в реальном времени.
+# 
 
-## Цели
+# This repository contains the implementation and experimental study of neural architectures for \*\*Speech Bandwidth Extension (BWE)\*\* based on the \*\*HiFi++\*\* framework.
 
-- Изучить и протестировать существующие архитектуры для BWE и SE.
-- Реализовать и адаптировать модель HiFi++ для различных режимов восстановления.
-- Исследовать возможность стриминговой обработки аудиосигналов.
-- Провести сравнительный анализ моделей и оценить их по метрикам качества и скорости.
+# 
 
-## Ключевые технологии
+# The primary goal of the project is to investigate the integration of \*\*Deep Filtering\*\* techniques into generative audio restoration models and to analyze the trade-off between reconstruction quality and computational complexity.
 
-- **HiFi++** (GAN-based vocoder)
-- **PyTorch** и **OmegaConf** для модульной разработки
-- Обработка **мелспектрограмм**
-- Оценка по метрикам: `MOSNet`, `SISDR`, `LSD`, `STOI`, `PESQ`, `COVL` и др.
-- Поддержка оффлайн и стримингового инференса
+# 
 
-## Архитектура HiFi++
+# The work was conducted as part of a Bachelor's Thesis focused on restoring wideband speech from narrowband recordings.
 
-- `SpectralUNet` — восстанавливает спектр в мел-области
-- `HiFi-GAN Upsampler` — переводит спектральные признаки в временную волну
-- `WaveUNet` — устраняет искажения во временной области
-- `SpectralMaskNet` — постобработка спектра (фильтрация и коррекция)
+# 
 
-## Режимы восстановления
+# \---
 
-| Режим | Частота входа | Частота выхода | Описание |
-|-------|----------------|----------------|----------|
-| BWE1  | до 1 кГц       | до 16 кГц      | Максимально деградированный |
-| BWE2  | до 2 кГц       | до 16 кГц      | Умеренное восстановление |
-| BWE4  | до 4 кГц       | до 16 кГц      | Минимально деградированный |
+# 
 
-## Результаты
+# \## Task
 
-| Режим | PESQ | STOI | SISDR | MOSNet |
-|-------|------|------|--------|--------|
-| BWE1  | 1.83 | 0.74 | 7.83   | 3.85   |
-| BWE2  | 2.77 | 0.89 | 12.87  | 3.95   |
-| BWE4  | 3.88 | 0.997| 17.49  | 4.13   |
+# 
 
-RTF (real-time factor) в стриминговом режиме улучшался с увеличением размера сегмента.
+# The considered Speech Bandwidth Extension task consists of reconstructing missing high-frequency components of speech.
 
-## Стриминговый инференс
+# 
 
-- Используется скользящее окно (`window_size`)
-- Каждый сегмент проходит через модель отдельно
-- Аудио собирается с минимальной задержкой
-- Поддерживаются адаптивные сборки с `marg_dict[file_id]`
+# In all experiments the model restores speech sampled at:
 
-## Датасеты
+# 
 
-- [VCTK092](https://datashare.ed.ac.uk/handle/10283/3443) — высококачественная речь от 109 дикторов
-- WAV формат (16 кГц, 16-bit PCM) используется после конвертации из FLAC
+# \* Input: \*\*4 kHz\*\*
 
-## Направления дальнейших исследований
+# \* Output: \*\*16 kHz\*\*
 
-- Проектирование специализированной стриминговой архитектуры
-- Комбинация BWE и Speech Enhancement в едином фреймворке
-- Устойчивость моделей к шуму и обрывам сигнала
-- Снижение вычислительных затрат для мобильных устройств
+# 
 
-## Цитирование
+# The objective is to recover high-frequency information while preserving speech naturalness and intelligibility.
 
-Основано на:
-- [HiFi++ (ICASSP 2023)](https://doi.org/10.1109/ICASSP49357.2023.10097255)
-- [BAE-Net](https://arxiv.org/abs/2312.13722)
-- [AERO](https://arxiv.org/abs/2211.12232)
-- [BEHM-GAN](https://arxiv.org/abs/2204.06478)
-- [iSTFTNet](https://ieeexplore.ieee.org/document/9747395)
+# 
+
+# \---
+
+# 
+
+# \## Baseline Architecture
+
+# 
+
+# The baseline model is based on the HiFi++ architecture and consists of the following modules:
+
+# 
+
+# \* \*\*SpectralUNet\*\* — spectral feature restoration in the mel-spectrogram domain;
+
+# \* \*\*HiFi-GAN Upsampler\*\* — conversion of spectral features into waveform representations;
+
+# \* \*\*WaveUNet\*\* — waveform refinement;
+
+# \* \*\*SpectralMaskNet\*\* — spectral post-processing module.
+
+# 
+
+# \---
+
+# 
+
+# \## Deep Filtering Experiments
+
+# 
+
+# Several modifications of the baseline architecture were implemented and evaluated.
+
+# 
+
+# \### Experiment 1: SpectralMaskNet → Deep Filtering
+
+# 
+
+# The SpectralMaskNet module is completely replaced with a Deep Filtering block operating in the time-frequency domain.
+
+# 
+
+# \### Experiment 2: Feature Deep Filtering
+
+# 
+
+# Deep Filtering is applied directly in the latent feature space of the generator before waveform reconstruction.
+
+# 
+
+# \### Experiment 3: DF Encoder Add
+
+# 
+
+# The DeepFilterNet encoder is used as an additional feature extraction branch whose embeddings are fused with HiFi++ representations.
+
+# 
+
+# \### Experiment 4: Conditioned Deep Filtering
+
+# 
+
+# Deep Filtering coefficients are conditioned on hidden features produced by the HiFi++ generator.
+
+# 
+
+# \---
+
+# 
+
+# \## Datasets
+
+# 
+
+# \### VCTK
+
+# 
+
+# \* 109 English speakers
+
+# \* High-quality speech recordings
+
+# \* Resampled to 16 kHz
+
+# 
+
+# The dataset is used for training and evaluation of all models.
+
+# 
+
+# \---
+
+# 
+
+# \## Evaluation Metrics
+
+# 
+
+# The following objective and perceptual metrics are used:
+
+# 
+
+# \### Spectral Metrics
+
+# 
+
+# \* LSD
+
+# \* LSD-LF
+
+# \* LSD-HF
+
+# 
+
+# \### Speech Quality Metrics
+
+# 
+
+# \* PESQ
+
+# \* STOI
+
+# \* COVL
+
+# \* CSIG
+
+# \* CBAK
+
+# 
+
+# \---
+
+# 
+
+# \## Main Findings
+
+# 
+
+# The experiments show that:
+
+# 
+
+# \* Deep Filtering improves spectral reconstruction quality, especially in the high-frequency region.
+
+# \* Direct replacement of SpectralMaskNet achieves the best spectral metrics.
+
+# \* Full DeepFilterNet integration substantially increases model size.
+
+# \* Lightweight integration strategies preserve most of the quality improvements while significantly reducing the number of parameters.
+
+# 
+
+# \---
+
+# 
+
+# \## Technologies
+
+# 
+
+# \* PyTorch
+
+# \* Hydra / OmegaConf
+
+# \* Comet ML
+
+# \* Torchaudio
+
+# \* Librosa
+
+# 
+
+# \---
+
+# 
+
+# \## Repository Structure
+
+# 
+
+# ```text
+
+# src/
+
+# ├── model/
+
+# │   ├── hifigan.py
+
+# │   ├── deep\_filter\_net.py
+
+# │   └── ...
+
+# ├── trainer/
+
+# ├── datasets/
+
+# ├── metrics/
+
+# ├── loss/
+
+# └── configs/
+
+# ```
+
+# 
+
+# \---
+
+# 
+
+# \## References
+
+# 
+
+# \* HiFi++: A Unified Framework for Bandwidth Extension and Speech Enhancement
+
+# \* DeepFilterNet: Perceptually Motivated Real-Time Speech Enhancement
+
+# \* AERO: Audio Super-Resolution in the Spectral Domain
+
+# \* DDSP: Differentiable Digital Signal Processing
+
+# \* VM-ASR: Lightweight Audio Super-Resolution with State Space Models
+
+
+
