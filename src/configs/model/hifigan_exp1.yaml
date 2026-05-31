@@ -18,8 +18,8 @@ generator_config:
   waveunet_block_widths: [10, 20, 40, 80]
   waveunet_block_depth: 4
 
-  use_spectralmasknet: True
-  use_deepfilternet: False
+  use_spectralmasknet: False
+  use_deepfilternet: True
   use_feature_deepfilternet: False
   use_df_encoder_branch: False
   use_conditioned_deepfilternet: False

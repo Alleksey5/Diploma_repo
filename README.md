@@ -8,7 +8,6 @@ The primary goal of the project is to investigate the integration of **Deep Filt
 
 The work was conducted as part of a Bachelor's Thesis focused on restoring wideband speech from narrowband recordings.
 
----
 
 ## Task
 
@@ -21,7 +20,6 @@ In all experiments the model restores speech sampled at:
 
 The objective is to recover high-frequency information while preserving speech naturalness and intelligibility.
 
----
 
 ## Baseline Architecture
 
@@ -32,7 +30,6 @@ The baseline model is based on the HiFi++ architecture and consists of the follo
 * **WaveUNet** — waveform refinement;
 * **SpectralMaskNet** — spectral post-processing module.
 
----
 
 ## Deep Filtering Experiments
 
@@ -54,7 +51,6 @@ The DeepFilterNet encoder is used as an additional feature extraction branch who
 
 Deep Filtering coefficients are conditioned on hidden features produced by the HiFi++ generator.
 
----
 
 ## Datasets
 
@@ -66,7 +62,6 @@ Deep Filtering coefficients are conditioned on hidden features produced by the H
 
 The dataset is used for training and evaluation of all models.
 
----
 
 ## Evaluation Metrics
 
@@ -86,7 +81,6 @@ The following objective and perceptual metrics are used:
 * CSIG
 * CBAK
 
----
 
 ## Main Findings
 
@@ -97,7 +91,6 @@ The experiments show that:
 * Full DeepFilterNet integration substantially increases model size.
 * Lightweight integration strategies preserve most of the quality improvements while significantly reducing the number of parameters.
 
----
 
 ## Technologies
 
@@ -107,7 +100,106 @@ The experiments show that:
 * Torchaudio
 * Librosa
 
----
+## Running Experiments
+
+The project uses Hydra for configuration management.
+
+### Main training configuration
+
+```text
+src/configs/hifigan_one_audio.yaml
+```
+
+### Available model configurations
+
+```text
+src/configs/model/
+
+hifigan_baseline.yaml
+hifigan_exp1.yaml
+hifigan_exp2.yaml
+hifigan_exp3.yaml
+hifigan_exp4.yaml
+```
+
+### Experiment descriptions
+
+| Config | Description |
+|----------|-------------|
+| `hifigan_baseline` | Original HiFi++ architecture |
+| `hifigan_exp1` | SpectralMaskNet replaced with Deep Filtering |
+| `hifigan_exp2` | Feature Deep Filtering in latent feature space |
+| `hifigan_exp3` | Additional DeepFilterNet encoder branch |
+| `hifigan_exp4` | Conditioned Deep Filtering |
+
+### Training
+
+Baseline:
+
+```bash
+python train.py --config-name hifigan_one_audio model=hifigan_baseline
+```
+
+Experiment 1:
+
+```bash
+python train.py --config-name hifigan_one_audio model=hifigan_exp1
+```
+
+Experiment 2:
+
+```bash
+python train.py --config-name hifigan_one_audio model=hifigan_exp2
+```
+
+Experiment 3:
+
+```bash
+python train.py --config-name hifigan_one_audio model=hifigan_exp3
+```
+
+Experiment 4:
+
+```bash
+python train.py --config-name hifigan_one_audio model=hifigan_exp4
+```
+
+### Overriding parameters
+
+Any Hydra parameter can be overridden from the command line:
+
+```bash
+python train.py \
+    --config-name hifigan_one_audio \
+    model=hifigan_exp3 \
+    trainer.n_epochs=500 \
+    trainer.epoch_len=120
+```
+
+### Inference
+
+Run inference using a trained checkpoint:
+
+```bash
+python inference.py \
+    inferencer.from_pretrained=<checkpoint_path>
+```
+
+### Computing Model Complexity
+
+To measure parameter count, MACs and FLOPs:
+
+```bash
+python count_flops.py model=hifigan_baseline
+```
+
+Example output:
+
+```text
+Params : 1.706M
+MACs   : 5.493G
+FLOPs  : 10.985G
+```
 
 ## Repository Structure
 
@@ -124,7 +216,6 @@ src/
 └── configs/
 ```
 
----
 
 ## References
 
